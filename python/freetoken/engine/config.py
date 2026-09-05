@@ -23,11 +23,16 @@ class EngineConfig:
     dtype: torch.dtype
     max_running_req: int = 4
     attention_backend: str = "auto"
+    # KV-cache quantization for plain full-attention pools: "off" (bf16) | "iso3" | "iso4"
+    # (IsoQuant: 3.125 / 4.25 bits per value; forces attention_backend="iso").
+    kv_cache_iso: str = "off"
     moe_strategy: str = "auto"
     # old name of moe_strategy; __post_init__ folds it in
     moe_backend: str | None = field(default=None, repr=False)
     # --quant-backend: layer[.kind]=kernel entries, comma separated
     quant_backend: str | None = None
+    # NVFP4 routed-expert GEMM backend (--nvfp4-backend): auto|marlin|flashinfer|triton.
+    nvfp4_backend: str = "triton"
     # PLE table backend: "disk" (default) reads rows from the checkpoint files per fill, "pinned" preloads the table into page-locked host RAM.
     ple_backend: str = "disk"
     # Expert-bank host load (--expert-load): auto|serial|parallel. "auto" reads scattered
