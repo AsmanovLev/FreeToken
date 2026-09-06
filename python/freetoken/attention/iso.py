@@ -52,6 +52,7 @@ class IsoMetadata(BaseAttnMetadata):
     prefix_total: int
     is_decode: bool
     max_q_len: int
+    q_positions: torch.Tensor | None = None
 
     def get_last_indices(self, bs: int) -> torch.Tensor:
         return self.cu_seqlens_q_gpu[1 : 1 + bs] - 1
@@ -72,6 +73,10 @@ class IsoAttentionBackend(BaseAttnBackend):
             default=int(getattr(config, "head_dim", 1)),
         )
         self.iso_fmt = getattr(self.kvcache, "iso_fmt", "iso3")
+        # dense bf16 decode scratch (k, v) grown on demand; reused across layers
+        self._decode_scratch: tuple[torch.Tensor, torch.Tensor] | None = None
+        self._decode_indices: torch.Tensor | None = None
+        self._decode_max_ctx = 0
 
     @staticmethod
     def _scratch_cap_bytes() -> int:
@@ -111,9 +116,62 @@ class IsoAttentionBackend(BaseAttnBackend):
         n = q.shape[0]
         nq = q.shape[1]
         if metadata.is_decode:
-            # quantize-on-write, then attend the whole packed sequence
-            out = torch.empty_like(q)
+            # quantize-on-write, then attend the whole sequence. The packed pool
+            # is dequantized ONCE per layer into a dense bf16 scratch and fed to
+            # the stock triton flash-decode kernel: O(ctx) with a small constant,
+            # ~90x faster at 32k than the packed custom decode kernel.
             self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
+            total = int(metadata.indptr[-1])
+            scratch_bytes = total * kv_heads * head_dim * 2 * 2
+            # capture sessions pin buffer shapes at capture time and indptr[-1]
+            # is a D2H read (illegal inside a graph) -> graphs always take the
+            # packed kernel path
+            free_ok = False
+            if self.capture is None and total > 0 and scratch_bytes <= self._scratch_cap_bytes():
+                free_bytes, _ = torch.cuda.mem_get_info(self.device)
+                free_ok = free_bytes > scratch_bytes + 64 * 2**20
+            if free_ok:
+                from freetoken.kernel.iso import iso_dequant_rows
+                from freetoken.kernel.triton.attention import decode_paged_attention
+
+                kd, vd = iso_dequant_rows(
+                    k_flat, v_flat, metadata.indices, kv_heads, head_dim,
+                    self.iso_fmt,
+                )
+                total_kv, max_splits = total, 8
+                if self._decode_scratch is None or self._decode_max_ctx < total_kv:
+                    self._decode_scratch = (
+                        torch.empty(total_kv, kv_heads, head_dim,
+                                    dtype=torch.bfloat16, device=self.device),
+                        torch.empty(total_kv, kv_heads, head_dim,
+                                    dtype=torch.bfloat16, device=self.device),
+                    )
+                    self._decode_max_ctx = total_kv
+                assert self._decode_scratch is not None
+                self._decode_scratch[0][:total_kv].copy_(kd.view(total_kv, kv_heads, head_dim))
+                self._decode_scratch[1][:total_kv].copy_(vd.view(total_kv, kv_heads, head_dim))
+                sk, sv = self._decode_scratch
+                if self._decode_indices is None or self._decode_indices.numel() < total_kv:
+                    self._decode_indices = torch.arange(
+                        total_kv, dtype=torch.int32, device=self.device)
+                attn_logits = torch.empty(
+                    (n, nq, 8, head_dim), dtype=torch.float32, device=self.device)
+                attn_lse = torch.empty((n, nq, 8), dtype=torch.float32, device=self.device)
+                num_kv_splits = torch.full((n,), 8, dtype=torch.int32, device=self.device)
+                return decode_paged_attention(
+                    q=q,
+                    k_cache=sk[:total_kv],
+                    v_cache=sv[:total_kv],
+                    indptr=metadata.indptr,
+                    indices=self._decode_indices[:total_kv],
+                    q_positions=metadata.q_positions,
+                    attn_logits=attn_logits,
+                    attn_lse=attn_lse,
+                    num_kv_splits=num_kv_splits,
+                    max_kv_splits=8,
+                    sm_scale=scale,
+                )
+            out = torch.empty_like(q)
             iso_attention_decode(
                 q.reshape(n, -1), out.reshape(n, -1), k_flat, v_flat,
                 metadata.indptr, metadata.indices,
@@ -209,6 +267,14 @@ class IsoAttentionBackend(BaseAttnBackend):
                 else torch.empty(0, dtype=torch.int32, device=device)
             )
 
+        if is_decode:
+            # triton decode expects the query token position per request
+            q_positions = torch.tensor(
+                [dl - 1 for dl in seqlens_k], dtype=torch.int32, device=device
+            )
+        else:
+            q_positions = getattr(batch, "positions", None)
+
         batch.attn_metadata = IsoMetadata(
             cu_seqlens_q_gpu=cu_seqlens_q_gpu,
             indptr=indptr,
@@ -220,6 +286,7 @@ class IsoAttentionBackend(BaseAttnBackend):
             prefix_total=prefix_total,
             is_decode=is_decode,
             max_q_len=max(seqlens_q),
+            q_positions=q_positions,
         )
 
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
@@ -244,6 +311,7 @@ class IsoAttentionBackend(BaseAttnBackend):
             prefix_total=0,
             is_decode=True,
             max_q_len=1,
+            q_positions=capture.positions[:bs],
         )
 
     def prepare_for_replay(self, batch: Batch) -> None:
@@ -256,6 +324,9 @@ class IsoAttentionBackend(BaseAttnBackend):
         indices = capture.page_table.view(-1)
         total = metadata.indices.numel()
         indices[:total].copy_(metadata.indices)
+        if metadata.q_positions is not None:
+            capture.positions[: metadata.q_positions.numel()].copy_(metadata.q_positions)
+            metadata.q_positions = capture.positions[: metadata.q_positions.numel()]
         metadata.cu_seqlens_q_gpu = capture.cu_seqlens_q[: bs + 1]
         metadata.indptr = capture.cu_seqlens_k[: bs + 1]
         metadata.indices = indices
