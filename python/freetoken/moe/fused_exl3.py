@@ -16,6 +16,8 @@ temp) with out-of-block routes masked to zero weight.
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 from freetoken.models.exl3 import dequant_exl3
@@ -23,6 +25,10 @@ from freetoken.models.exl3 import dequant_exl3
 # experts per prefill block; w1+w2 bf16 for a block ~= G x 8 MB at H=2048, I=512
 # (plus the fla/attention workspace, on GPUs with ~0.1 GiB of VRAM headroom)
 _PREFILL_BLOCK = 4
+
+# fused CUDA dequant kernel (default on); FREETOKEN_EXL3_FUSED=0 keeps the
+# torch-level reference path (useful for debugging / as a correctness oracle)
+_USE_FUSED = os.environ.get("FREETOKEN_EXL3_FUSED", "1") != "0"
 
 
 def _row_params(numel: int, H: int, I: int, kind: str, k_bits: int) -> tuple[int, int]:
@@ -37,11 +43,35 @@ def _row_params(numel: int, H: int, I: int, kind: str, k_bits: int) -> tuple[int
     return tb, tb_max
 
 
-def _dequant_rows(
+def _dequant_rows_fused(
+    rows: torch.Tensor, H: int, I: int, kind: str, cb: int, k_bits: int
+) -> torch.Tensor:
+    """Fused-kernel dequant: one launch per matrix field (2 for gate_up)."""
+    from freetoken.kernel.exl3 import exl3_dequant_fused
+
+    tb, tb_max = _row_params(rows.shape[1], H, I, kind, k_bits)
+    del tb  # the kernel reads exactly 16*K*2-byte words per tile; padding is skipped
+    n = rows.shape[0]
+    if kind == "gate_up":
+        out = torch.empty(n, 2 * I, H, dtype=torch.bfloat16, device=rows.device)
+        exl3_dequant_fused(rows, out[:, :I], 0, 2 * tb_max, 2 * tb_max + 2 * H,
+                           H, I, cb, k_bits)
+        base = 2 * tb_max + 2 * H + 2 * I
+        exl3_dequant_fused(rows, out[:, I:], tb_max, base, base + 2 * H,
+                           H, I, cb, k_bits)
+    else:
+        out = torch.empty(n, H, I, dtype=torch.bfloat16, device=rows.device)
+        exl3_dequant_fused(rows, out, 0, tb_max, tb_max + 2 * I,
+                           I, H, cb, k_bits)
+    return out
+
+
+def _dequant_rows_torch(
     rows: torch.Tensor, H: int, I: int, kind: str, cb: int, k_bits: int
 ) -> torch.Tensor:
     """[N, row_bytes] uint8 -> bf16 [N, 2I, H] (gate_up) or [N, H, I] (down).
 
+    Torch-level reference path (kept for debugging / correctness checks).
     Rows are padded to the max-K field width; only the first tb bytes of each
     trellis field are valid for this layer's K. Dequant runs one expert at a
     time (peak fp32 intermediate = one matrix, ~8 MB) into a bf16 output --
@@ -83,6 +113,15 @@ def _dequant_rows(
                       row[:, tb_max + 2 * I :], I, H)
             out[j] = down[0].to(torch.bfloat16)
     return out
+
+
+def _dequant_rows(
+    rows: torch.Tensor, H: int, I: int, kind: str, cb: int, k_bits: int
+) -> torch.Tensor:
+    """[N, row_bytes] uint8 -> bf16 [N, 2I, H] (gate_up) or [N, H, I] (down)."""
+    if _USE_FUSED and rows.is_cuda:
+        return _dequant_rows_fused(rows, H, I, kind, cb, k_bits)
+    return _dequant_rows_torch(rows, H, I, kind, cb, k_bits)
 
 
 def fused_experts_exl3(
