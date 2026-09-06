@@ -45,6 +45,10 @@ class ExpertBanks:
     down_alpha: torch.Tensor | None = field(default=None)
     # per-layer HostResidency values actually applied by the loader; None -> all pinned (also the degrade signal when a request was not honored)
     layer_residency: list[str] | None = field(default=None)
+    # EXL3 codebook (0 = legacy, 1 = mcg, 2 = mul1); only for quant_format="exl3"
+    exl3_codebook: int = 1
+    # EXL3 bits-per-weight per MoE layer (mixed-rate recipes); None for uniform-K
+    exl3_k_per_layer: tuple[int, ...] | None = None
     # True iff the ``layer_sink`` passed to the loader was actually engaged (each layer
     # streamed straight to its sink instead of staying materialized here) -- set by
     # convert.py's per-format streaming gate; ``sources`` may hold released tensors.

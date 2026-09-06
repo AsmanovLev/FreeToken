@@ -622,6 +622,8 @@ class Engine:
                 quant_format=banks.quant_format,
                 decode_target=decode_target,
                 hybrid_max_fetch=config.moe_hybrid_max_fetch,
+                exl3_codebook=getattr(banks, "exl3_codebook", 1),
+                exl3_k_per_layer=getattr(banks, "exl3_k_per_layer", None),
             )
             # before set_bank_sources: the residency validation and the copy plan's skip of non-pinned layers key on the CPU-layer set
             cache.cpu_layer_ids = cpu_layer_ids
@@ -1385,7 +1387,9 @@ def _adjust_config(config: EngineConfig):
         from freetoken.moe.bench_profile import load_backend_recommendation
 
         gpu_name, gpu_uuid = _profile_gpu()
-        if load_backend_recommendation(bench_fmt, gpu_name=gpu_name, gpu_uuid=gpu_uuid) == "hybrid":
+        # EXL3 banks are trellis-packed bytes the CPU executor cannot read: never
+        # upgrade to hybrid for them (and an explicit cpu/hybrid pick errors below).
+        if expert_quant != "exl3" and load_backend_recommendation(bench_fmt, gpu_name=gpu_name, gpu_uuid=gpu_uuid) == "hybrid":
             from freetoken.moe.cpu_executor import compiled_extension_supports
 
             _act = getattr(model_config, "hidden_act", "silu")
@@ -1476,6 +1480,12 @@ def _adjust_config(config: EngineConfig):
         raise ValueError(
             f"{expert_quant} experts require --moe-backend offload or cpu, "
             f"got {config.moe_backend!r}"
+        )
+
+    if is_moe and expert_quant == "exl3" and config.moe_backend != "offload":
+        raise ValueError(
+            "exl3 experts require --moe-backend offload (the CPU executor cannot "
+            f"read trellis-packed banks), got {config.moe_backend!r}"
         )
 
     if is_moe and config.moe_cpu_layers and config.moe_backend not in ("offload", "hybrid"):

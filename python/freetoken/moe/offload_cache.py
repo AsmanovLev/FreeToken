@@ -75,6 +75,9 @@ _BANK_SCHEMAS: dict[str, tuple[str, ...]] = {
     # DeepSeek-V4 FP4: packed e2m1 codes + e8m0 per-32 block scales, no global scale
     # (4 banks). Read by DeepSeek-V4's own DS-FP4 grouped GEMV kernels via bank_views().
     "ds_fp4": ("gate_up_packed", "gate_up_scale", "down_packed", "down_scale"),
+    # EXL3 (QTIP trellis) experts, packed byte rows (trellis | suh | svh per proj):
+    # dequantized to bf16 on the fly in _expert_gemm, served by the stock bf16 GEMM.
+    "exl3": ("gate_up", "down"),
 }
 
 # lives in kernel/aot_models.py: the AOT row table shares it and must stay importable in the torch-only kernel-cache build env, which cannot import freetoken.moe
@@ -93,6 +96,11 @@ _BANK_BYTES_PER_EXPERT = {
     "nvfp4": lambda H, I: 2 * I * (H // 2 + H // 16 + 2) + H * (I // 2 + I // 16 + 2),
     "mxfp4": lambda H, I: 2 * I * (H // 2 + H // 32 + 2) + H * (I // 2 + I // 32 + 2),
     "ds_fp4": lambda H, I: 2 * I * (H // 2 + H // 32) + H * (I // 2 + I // 32),
+    # EXL3 (QTIP trellis) experts, packed byte rows padded to the checkpoint's
+    # max-K field width; estimated at K=4 (covers the common 2-4 bpw recipes;
+    # the exact per-layer K list rides on the cache's exl3_k_per_layer).
+    # 3 projections x (H*I*K/8 trellis + 2H suh + 2I svh):
+    "exl3": lambda H, I: 3 * H * I // 2 + 6 * (H + I),
 }
 
 # vLLM's marlin grouped-GEMM hands the full [cache_size] slot cache as its expert
@@ -141,6 +149,11 @@ class OffloadMoeCache:
     # pcie_bw / cpu_bw ratio so the PCIe fetch and the CPU overflow GEMV take equal
     # time (perfect overlap): fetched : cpu = pcie : cpu - pcie.
     hybrid_fetch_fraction: float = 0.0
+    # EXL3 codebook (0 = legacy 3inst, 1 = mcg, 2 = mul1); read from the
+    # checkpoint by the bank provider. Only meaningful for quant_format="exl3".
+    exl3_codebook: int = 1
+    # EXL3 bits-per-weight per MoE layer (mixed-rate recipes pad rows to max K).
+    exl3_k_per_layer: tuple[int, ...] | None = None
 
     def __post_init__(self) -> None:
         policy_ids = {"lru": 0}

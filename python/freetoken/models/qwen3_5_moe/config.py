@@ -49,6 +49,11 @@ def _expert_quant(hf_config: Any) -> str:
     if get is None:
         return "none"
     algo = str(get("quant_algo") or get("quant_method") or "").lower()
+    if algo == "exl3":
+        # ExLlamaV3 QTIP trellis checkpoints: routed experts packed as
+        # trellis/suh/svh tables (see freetoken.models.exl3); everything else
+        # (dense attention/GDN/shared-expert/lm_head) stays plain fp16/bf16.
+        return "exl3"
     if "fp4" in algo:
         return "nvfp4"
     if "mixed" in algo:

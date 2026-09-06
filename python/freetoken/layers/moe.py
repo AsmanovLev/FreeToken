@@ -570,6 +570,30 @@ class OffloadMoELayer(MoELayer):
                 gate_up_packed, gate_up_scale, down_packed, down_scale,
                 self.swiglu_limit,
             )
+        if fmt == "exl3":
+            # EXL3 (QTIP trellis) packed expert banks: the routed rows are
+            # dequantized to bf16 on the fly, then served by the stock bf16
+            # grouped GEMM. Host banks + slot cache stay packed (the win: ~2x
+            # smaller RAM footprint and PCIe traffic than bf16 offload).
+            from freetoken.moe.fused_exl3 import fused_experts_exl3
+
+            gate_up, down = views
+            ks = getattr(cache, "exl3_k_per_layer", None)
+            k_bits = ks[self.layer_id] if ks is not None else 3
+            return fused_experts_exl3(
+                hidden_states,
+                gate_up,
+                down,
+                topk_weights,
+                topk_ids,
+                self.activation,
+                self.apply_router_weight_on_input,
+                self.hidden_size,
+                self.intermediate_size,
+                getattr(cache, "exl3_codebook", 1),
+                k_bits,
+                is_prefill=is_prefill,
+            )
         assert fmt == "bf16", f"unknown quant_format {fmt!r}"
         gate_up, down = views
         impl = fused_experts_impl if is_prefill else fused_experts_decode_impl

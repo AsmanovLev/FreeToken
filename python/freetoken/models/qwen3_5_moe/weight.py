@@ -51,6 +51,10 @@ _NVFP4_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
 # never yielded on their own.
 _SCALE_SUFFIXES = (".weight_scale", ".weight_scale_2", ".input_scale")
 
+# EXL3 (ExLlamaV3 QTIP trellis) per-expert tables; packed into the offload banks by
+# _setup_exl3_banks, never yielded to the dense pass.
+_EXL3_SUFFIX_RE = re.compile(r"\.(trellis|suh|svh|su|sv|mcg|mul1)$")
+
 # Gemma-style (1+weight) RMSNorm weights. Excludes GDN gated norm (linear_attn.norm),
 # which is a standard weight*x norm.
 _GEMMA_NORM_SUFFIXES = (
@@ -235,6 +239,14 @@ def iter_weights(
                 # ``.mlp.experts.<int>.`` so they are unaffected and still hit _PACKED_EXPERT.
                 if _NVFP4_EXPERT_RE.search(raw_name):
                     continue
+                # EXL3 expert tables live in the offload banks, not the dense pass.
+                if _EXL3_SUFFIX_RE.search(raw_name):
+                    if ".mlp.experts." in raw_name or raw_name.startswith("mtp."):
+                        continue
+                    raise NotImplementedError(
+                        f"dense EXL3 tensor {raw_name!r}: only routed-expert EXL3 "
+                        "quantization is supported for now"
+                    )
                 # Standalone modelopt scales are consumed with their .weight, never yielded.
                 if raw_name.endswith(_SCALE_SUFFIXES):
                     continue
@@ -831,6 +843,121 @@ class _ShardReader:
         self._handles.clear()
 
 
+def _setup_exl3_banks(model_path, model_config, device, dummy, *, layer_sink=None):
+    """Pack EXL3 routed-expert tables into pinned uint8 row banks (no dequant at load).
+
+    Row layouts (see moe/fused_exl3.py): gate_up = gate.trellis | up.trellis |
+    gate.suh | gate.svh | up.suh | up.svh; down = down.trellis | down.suh | down.svh.
+    Dequant happens on the fly in the MoE GEMM arm, so host RAM and PCIe traffic
+    stay at the packed bitrate."""
+    from freetoken.moe.expert_banks import ExpertBanks
+    from freetoken.moe.host_banks import LayerCompletionTracker, PinPipeline, alloc_layer_banks
+
+    L, E, H, I, dense = _moe_dims(model_config)
+    if dummy:
+        K = 3  # arbitrary valid placeholder geometry
+        tb = H * I * K // 8
+        specs = {
+            "gate_up": ((E, 2 * tb + 4 * H + 4 * I), torch.uint8),
+            "down": ((E, tb + 2 * H + 2 * I), torch.uint8),
+        }
+        banks = {n: [torch.zeros(s, dtype=dt) for _ in range(L)] for n, (s, dt) in specs.items()}
+        return ExpertBanks("exl3", banks, exl3_codebook=1, exl3_k_per_layer=(3,) * L)
+
+    folder = download_hf_weight(model_path)
+    with open(os.path.join(folder, "model.safetensors.index.json")) as fh:
+        wmap = json.load(fh)["weight_map"]
+    keyset = set(wmap)
+
+    p0 = f"model.language_model.layers.{dense}.mlp.experts.0"
+    if f"{p0}.gate_proj.su" in keyset or f"{p0}.gate_proj.sv" in keyset:
+        raise NotImplementedError(
+            "legacy EXL3 su/sv sign bitfields are not supported (modern checkpoints "
+            "store fp16 suh/svh); re-quantize with a newer exllamav3"
+        )
+    has_mcg = f"{p0}.gate_proj.mcg" in keyset
+    has_mul1 = f"{p0}.gate_proj.mul1" in keyset
+    if has_mcg and has_mul1:
+        raise ValueError(f"EXL3 checkpoint {model_path} carries both .mcg and .mul1 sentinels")
+    codebook = 2 if has_mul1 else (1 if has_mcg else 0)
+
+    reader = _expert_reader(model_path, torch.device("cpu"))
+    try:
+        # EXL3 recipes are mixed-rate: K (bits/weight) varies per layer. Rows are
+        # padded to the max-K layout; the per-layer K list rides on the cache.
+        ks: list[int] = []
+        for li in range(L):
+            t = reader.get(f"model.language_model.layers.{dense + li}.mlp.experts.0.gate_proj.trellis")
+            tk, tn = t.shape[0] * 16, t.shape[1] * 16
+            if (tk, tn) != (H, I):
+                raise ValueError(f"EXL3 gate_proj geometry {tk}x{tn} != config {H}x{I}")
+            ks.append(t.shape[2] // 16)
+            del t
+        k_max = max(ks)
+        tb_max = H * I * k_max // 8  # trellis bytes per projection at max K
+        row_gu = 2 * tb_max + 4 * H + 4 * I
+        row_dn = tb_max + 2 * H + 2 * I
+        specs = {
+            "gate_up": ((E, row_gu), torch.uint8),
+            "down": ((E, row_dn), torch.uint8),
+        }
+        hb = alloc_layer_banks(specs, L)  # lazy anon mmaps (zero-filled)
+        banks = {name: [b.tensor for b in hb[name]] for name in specs}
+        gate_up, down = banks["gate_up"], banks["down"]
+        primary = get_tp_info().is_primary()
+
+        def _put(row: torch.Tensor, off: int, t: torch.Tensor) -> int:
+            b = t.view(torch.uint8).reshape(-1)
+            row[off : off + b.numel()].copy_(b)
+            return off + b.numel()
+
+        def _load(sink) -> None:
+            # all 12 tensors of one expert packed per note -> E writes/layer
+            tracker = LayerCompletionTracker(E, hb, sink) if sink is not None else None
+            for li in tqdm(range(L), desc="Packing EXL3 experts", disable=not primary):
+                layer = dense + li
+                tb = H * I * ks[li] // 8
+                for e in range(E):
+                    p = f"model.language_model.layers.{layer}.mlp.experts.{e}"
+                    row = gate_up[li][e]
+                    off = 0
+                    for proj in ("gate", "up"):
+                        t = reader.get(f"{p}.{proj}_proj.trellis")
+                        assert t.numel() * 2 == tb, (
+                            f"gate/up K mismatch within layer {layer}: {p}.{proj}_proj"
+                        )
+                        off = _put(row, off, t)
+                        off += tb_max - tb  # zero pad to the max-K field
+                    for proj in ("gate", "up"):
+                        off = _put(row, off, reader.get(f"{p}.{proj}_proj.suh"))
+                        off = _put(row, off, reader.get(f"{p}.{proj}_proj.svh"))
+                    assert off == row_gu
+                    row_d = down[li][e]
+                    t = reader.get(f"{p}.down_proj.trellis")
+                    assert t.numel() * 2 == tb, (
+                        f"down K mismatch within layer {layer}: {p}.down_proj"
+                    )
+                    off = _put(row_d, 0, t)
+                    off += tb_max - tb
+                    off = _put(row_d, off, reader.get(f"{p}.down_proj.suh"))
+                    off = _put(row_d, off, reader.get(f"{p}.down_proj.svh"))
+                    assert off == row_dn
+                    if tracker is not None:
+                        tracker.note(li)
+    finally:
+        reader.close()
+
+    if layer_sink is not None:
+        _load(layer_sink)
+    elif torch.cuda.is_available():
+        with PinPipeline() as pins:
+            _load(pins)
+    else:
+        _load(None)  # CUDA-less: mmap banks stay pageable, never pinned
+    return ExpertBanks("exl3", banks, exl3_codebook=codebook,
+                       exl3_k_per_layer=tuple(ks), streamed=layer_sink is not None)
+
+
 def setup_offload_expert_banks(
     model_path: str, model_config, *, device: torch.device, dtype: torch.dtype,
     dummy: bool = False, parallel: bool = False, workers: int = 8, chunk: int = 8 << 20,
@@ -851,6 +978,11 @@ def setup_offload_expert_banks(
     ``decode_target`` is forwarded so the cpu backend gets CPU-readable (native, non-
     GPU-tiled) bank layouts -- e.g. native ``nvfp4`` rows rather than marlin/b12x."""
     eq = getattr(model_config, "expert_quant", "none")
+    if eq == "exl3":
+        if get_tp_info().size > 1:
+            raise NotImplementedError("qwen3_5_moe exl3 expert banks support TP=1 only")
+        return _setup_exl3_banks(model_path, model_config, device, dummy,
+                                 layer_sink=None if dummy else layer_sink)
     if eq != "fp8_block":
         from freetoken.moe.expert_banks import _PROVIDERS  # nvfp4 -> _nvfp4_banks, none -> _bf16_banks
 

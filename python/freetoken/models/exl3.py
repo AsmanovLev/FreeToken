@@ -132,13 +132,14 @@ def dequant_exl3(
     svh: torch.Tensor,
     codebook: int,
 ) -> torch.Tensor:
-    """Reconstruct one EXL3 linear layer as fp32 W.T -> [out, in] (HF orientation).
+    """Reconstruct EXL3 linear layer(s) as fp32 W.T -> [..., out, in] (HF orientation).
 
-    trellis: int16 (in/16, out/16, 16*K); suh fp16 (in,); svh fp16 (out,).
+    trellis: int16 (..., in/16, out/16, 16*K) -- arbitrary leading batch dims OK;
+    suh fp16 (..., in); svh fp16 (..., out).
     """
-    if trellis.dtype != torch.int16 or trellis.dim() != 3:
-        raise ValueError(f"trellis must be int16 (in/16, out/16, 16K), got {trellis.shape} {trellis.dtype}")
-    tk, tn, w = trellis.shape
+    if trellis.dtype != torch.int16 or trellis.dim() < 3:
+        raise ValueError(f"trellis must be int16 (..., in/16, out/16, 16K), got {trellis.shape} {trellis.dtype}")
+    tk, tn, w = trellis.shape[-3:]
     if w % 16 != 0:
         raise ValueError(f"trellis last dim {w} not a multiple of 16")
     k_bits = w // 16
@@ -149,23 +150,28 @@ def dequant_exl3(
         raise ValueError(f"padded dims ({in_f}, {out_f}) must be multiples of {_HAD_K}")
 
     device = trellis.device
-    win = _unpack_windows(trellis.reshape(tk * tn, w), k_bits)  # (T, 256)
-    vals = _decode_windows(win, codebook)  # (T, 256) fp32
+    lead = trellis.shape[:-3]
+    win = _unpack_windows(trellis.reshape(-1, w), k_bits)  # (N, 256)
+    vals = _decode_windows(win, codebook)  # (N, 256) fp32
     perm = _tensor_core_perm(device)
     tiles = torch.empty_like(vals)
     tiles.scatter_(1, perm.unsqueeze(0).expand_as(vals), vals)
     w_hat = (
-        tiles.reshape(tk, tn, 16, 16)
-        .permute(0, 2, 1, 3)
-        .reshape(in_f, out_f)
-    )  # (in, out)
+        tiles.reshape(*lead, tk, tn, 16, 16)
+        .transpose(-3, -2)  # (..., tk, 16r, tn, 16c)
+        .reshape(*lead, in_f, out_f)
+    )  # (..., in, out)
 
     # block-diagonal hadamard un-rotation, both sides
     h = _hadamard128(device)
-    w_hat = w_hat.view(in_f // _HAD_K, _HAD_K, out_f)
+    w_hat = w_hat.reshape(*lead, in_f // _HAD_K, _HAD_K, out_f)
     w_hat = h @ w_hat  # left
-    w_hat = w_hat.view(in_f, out_f // _HAD_K, _HAD_K)
+    w_hat = w_hat.reshape(*lead, in_f, out_f // _HAD_K, _HAD_K)
     w_hat = w_hat @ h  # right
 
-    w = w_hat.view(in_f, out_f) * suh.float().unsqueeze(1) * svh.float().unsqueeze(0)
-    return w.t().contiguous()  # [out, in], HF orientation
+    w = (
+        w_hat.reshape(*lead, in_f, out_f)
+        * suh.float().unsqueeze(-1)
+        * svh.float().unsqueeze(-2)
+    )
+    return w.mT.contiguous()  # [..., out, in], HF orientation
