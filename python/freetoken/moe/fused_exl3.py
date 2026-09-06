@@ -22,9 +22,13 @@ import torch
 
 from freetoken.models.exl3 import dequant_exl3
 
-# experts per prefill block; w1+w2 bf16 for a block ~= G x 8 MB at H=2048, I=512
-# (plus the fla/attention workspace, on GPUs with ~0.1 GiB of VRAM headroom)
-_PREFILL_BLOCK = 4
+# experts per prefill block. Per expert the transient w1+w2 bf16 = 2*I*2I*2 + I*H*2
+# bytes (H=2048, I=768: ~8.5 MB), plus the stock GEMM's own workspace. A large
+# block amortizes the grouped-GEMM launch overhead: 256 experts at block 4 need
+# 64 GEMM launches (~6.6 s/chunk on a 3060) vs 8 at block 32 (~0.14 s, 47x).
+# The block is clamped down by free VRAM at call time (see _prefill_block_size);
+# FREETOKEN_EXL3_PREFILL_BLOCK pins it explicitly (debugging / tight-VRAM configs).
+_PREFILL_BLOCK = 32
 
 # fused CUDA dequant kernel (default on); FREETOKEN_EXL3_FUSED=0 keeps the
 # torch-level reference path (useful for debugging / as a correctness oracle)
@@ -41,6 +45,33 @@ def _row_params(numel: int, H: int, I: int, kind: str, k_bits: int) -> tuple[int
     if tb <= 0 or tb > tb_max:
         raise ValueError(f"exl3 {kind} row of {numel} B does not fit H={H} I={I} K={k_bits}")
     return tb, tb_max
+
+
+def _prefill_block_size(H: int, I: int) -> int:
+    """Prefill dequant block, clamped by available VRAM.
+
+    One expert block needs 2*I*(2I+H)*2 bytes of transient bf16 w1+w2
+    (H=2048, I=768 -> ~8.5 MB/expert) plus the grouped-GEMM workspace; a big
+    block amortizes the per-launch overhead (block 4 -> 64 launches/chunk,
+    block 32 -> 8). Availability = driver free + the allocator's unused
+    reserved cache: transients circulate through the caching allocator, so
+    driver free alone is misleading once the pool/cache have grown reserved.
+    FREETOKEN_EXL3_PREFILL_BLOCK pins the block explicitly."""
+    pinned = os.environ.get("FREETOKEN_EXL3_PREFILL_BLOCK")
+    if pinned:
+        return max(1, int(pinned))
+    try:
+        free_d, _total = torch.cuda.mem_get_info()
+        cached = torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+    except Exception:
+        return _PREFILL_BLOCK
+    avail = free_d + max(0, cached)
+    # all-in per-expert transient: bf16 w1+w2 (~8.5 MB at H=2048/I=768) plus the
+    # grouped-GEMM workspace it feeds (measured ~16 MB/expert at 512-token
+    # chunks); ~32 MB/expert total keeps a safety margin for fragmentation
+    per_expert = 4 * I * (2 * I + H) * 2
+    block = int(avail // per_expert)
+    return max(1, min(_PREFILL_BLOCK, block))
 
 
 def _dequant_rows_fused(
@@ -155,24 +186,37 @@ def fused_experts_exl3(
             apply_router_weight_on_input,
         )
 
-    # prefill: expert blocks, out-of-block routes masked to zero weight
+    # prefill: expert blocks, out-of-block routes masked to zero weight.
+    # VRAM availability shifts DURING the chunk (fla workspace grows etc.), so
+    # the block size is only a hint: on OOM the block halves and the chunk
+    # retries (completed blocks are kept).
     num_experts = gate_up.shape[0]
     sel = topk_ids.unique()
+    block = _prefill_block_size(H, I)
     out = None
-    for i in range(0, sel.numel(), _PREFILL_BLOCK):
-        blk = sel[i : i + _PREFILL_BLOCK]
+    i = 0
+    while i < sel.numel():
+        blk = sel[i : i + block]
         g = blk.numel()
-        w1 = _dequant_rows(gate_up[blk], H, I, "gate_up", codebook, k_bits)
-        w2 = _dequant_rows(down[blk], H, I, "down", codebook, k_bits)
-        mapping = torch.full((num_experts,), -1, dtype=torch.int32, device=blk.device)
-        mapping[blk] = torch.arange(g, dtype=torch.int32, device=blk.device)
-        ids_l = mapping[topk_ids]
-        mask = ids_l >= 0
-        ids_l = ids_l.clamp_min(0).contiguous()
-        w_l = torch.where(mask, topk_weights, topk_weights.new_zeros(())).contiguous()
-        out_b = fused_experts_impl(
-            hidden_states.clone(), w1, w2, w_l, ids_l, activation,
-            apply_router_weight_on_input,
-        )
+        try:
+            w1 = _dequant_rows(gate_up[blk], H, I, "gate_up", codebook, k_bits)
+            w2 = _dequant_rows(down[blk], H, I, "down", codebook, k_bits)
+            mapping = torch.full((num_experts,), -1, dtype=torch.int32, device=blk.device)
+            mapping[blk] = torch.arange(g, dtype=torch.int32, device=blk.device)
+            ids_l = mapping[topk_ids]
+            mask = ids_l >= 0
+            ids_l = ids_l.clamp_min(0).contiguous()
+            w_l = torch.where(mask, topk_weights, topk_weights.new_zeros(())).contiguous()
+            out_b = fused_experts_impl(
+                hidden_states.clone(), w1, w2, w_l, ids_l, activation,
+                apply_router_weight_on_input,
+            )
+        except torch.OutOfMemoryError:
+            if block == 1:
+                raise
+            block = max(1, block // 2)
+            torch.cuda.empty_cache()
+            continue
         out = out_b if out is None else out + out_b
+        i += block
     return out
