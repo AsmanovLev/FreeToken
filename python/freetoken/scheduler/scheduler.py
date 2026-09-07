@@ -444,16 +444,12 @@ class Scheduler(SchedulerIOMixin):
         """
         return self.cache_manager.page_usage()
 
-    def _mamba_slot_usage(self) -> Tuple[int, int] | None:
-        """(used_slots, total_slots) of the GDN-state (mamba) pool for hybrid models, else None.
-
-        Mirrors SGLang's mamba-pool semantics: ``total`` excludes the reserved padding
-        sink (slot 0); ``used`` excludes free slots and evictable tree snapshots.
-        """
-        if not self.cache_manager.is_hybrid:
-            return None
-        total = self.cache_manager.linear_state_pool.num_slots - 1
-        return total - self.cache_manager.mamba_available_size, total
+        pool = self.cache_manager.linear_state_pool
+        total = pool.num_slots - 1
+        if pool.host_snapshots:
+            # host mode: tree snapshots live in pinned host memory, the VRAM pool
+            # only ever holds live slots -> usage is just the non-free slots
+            return total - pool.num_free_slots, total
 
     def _swa_token_usage(self) -> Tuple[int, int] | None:
         """(used_tokens, total_tokens) of the window (swa) pool for SWA models, else None.

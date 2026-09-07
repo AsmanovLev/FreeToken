@@ -386,14 +386,27 @@ class CacheManager:
             # page_size==1). For page_size>1 a non-aligned cached_len would attach an over-advanced
             # state to a shorter prefix node -> skip the finish-donate (the ×64 prefill snapshots
             # remain as reuse points).
+            #
+            # Host-snapshot mode: D2H the live state into the pinned host store and donate the
+            # host id instead; the VRAM live slot is always freed back (the tree never holds
+            # VRAM slots in this mode). The D2H is enqueued on the engine stream (synchronized
+            # when the caller runs on another stream), so freeing the slot right after is safe.
             insert_len = align_down(req.cached_len, self.page_size)
             keep_live = False
             if insert_len == req.cached_len and insert_len > 0:
-                prefix_len, mamba_exist = self.prefix_cache.insert(
-                    req.input_ids[:insert_len], page_indices[:insert_len], req.linear_slot_idx)
+                if pool.host_snapshots:
+                    host_id = pool.snapshot_to_host(req.linear_slot_idx)
+                    prefix_len, mamba_exist = self.prefix_cache.insert(
+                        req.input_ids[:insert_len], page_indices[:insert_len], host_id)
+                    if mamba_exist:
+                        # the tree kept its existing snapshot; ours is a duplicate
+                        pool.free([host_id])
+                else:
+                    prefix_len, mamba_exist = self.prefix_cache.insert(
+                        req.input_ids[:insert_len], page_indices[:insert_len], req.linear_slot_idx)
                 self.unlock(old_handle)
                 self._free(page_indices[free_upto : max(free_upto, prefix_len)])
-                keep_live = not mamba_exist           # tree now owns linear_slot_idx
+                keep_live = not pool.host_snapshots and not mamba_exist
             else:
                 self.unlock(old_handle)
                 self._free(page_indices[free_upto :])
@@ -546,6 +559,8 @@ class CacheManager:
             # exceed the (non-padding) pool capacity; the remainder is held by running requests.
             pool = self.linear_state_pool
             tree_slots = pc.mamba_evictable_size + pc.mamba_protected
+            # host-snapshot mode: tree-held ids index the pinned host store, not the VRAM pool
+            tree_slots -= pool.num_host_snapshots
             assert pool.num_free_slots + tree_slots <= pool.num_slots - 1, (
                 f"GDN-slot leak: free({pool.num_free_slots}) + tree({tree_slots}) > "
                 f"capacity({pool.num_slots - 1})"
