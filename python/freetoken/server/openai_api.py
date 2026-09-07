@@ -677,10 +677,20 @@ def _served_model_name(state: Any) -> str:
 
 
 def _model_context_length(state: Any) -> int | None:
-    """The model ceiling, not `min(ceiling, KV budget)`: a rebuild moves the latter, and agents
-    read this once at startup."""
+    """The effective context ceiling the server will actually serve: the model
+    ceiling capped by explicit capacity overrides (--num-tokens / --max-seq-len),
+    not the raw HF-config value. Agents read this once at startup and plan their
+    window by it, so an override the engine honors must be reflected here."""
     try:  # never 500 a metadata route: max_seq_len walks into the HF config on some builds
         value = int(state.config.max_seq_len)
     except Exception:  # noqa: BLE001
         return None
-    return value if value > 0 else None
+    if value <= 0:
+        return None
+    override = getattr(state.config, "num_token_override", None)
+    if override:
+        value = min(value, int(override))
+    seq_override = getattr(state.config, "max_seq_len_override", None)
+    if seq_override:
+        value = min(value, int(seq_override))
+    return value
