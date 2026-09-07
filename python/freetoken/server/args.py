@@ -395,6 +395,15 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--linear-state-cache-ratio",
+        type=float,
+        default=ServerArgs.linear_state_cache_ratio,
+        help="Hybrid GDN models: GDN snapshot cache sized as ceil(ratio x max-running-req) "
+        "extra slots. A value below 1.0 disables the snapshot cache (4 slots per running "
+        "request remain); frees ~240 MB/slot-block on tight GPUs using hybrid_radix.",
+    )
+
+    parser.add_argument(
         "--enable-cache-report",
         action="store_true",
         default=ServerArgs.enable_cache_report,

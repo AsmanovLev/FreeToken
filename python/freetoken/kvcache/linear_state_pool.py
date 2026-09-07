@@ -280,11 +280,15 @@ def state_pool_bytes(config, num_slots: int | None = None) -> int:
 def _linear_pool_num_slots(config) -> int:
     """LinearStatePool slot count. Hybrid-radix non-evictable peak is 4 slots per running request
     (1 live + 2 ping-pong + 1 committed snapshot locked through decode), plus a cross-request
-    snapshot cache and a padding sink; naive GDN keeps the old (max_running_req + 1)."""
+    snapshot cache and a padding sink; naive GDN keeps the old (max_running_req + 1). A
+    linear_state_cache_ratio below 1.0 disables the snapshot cache entirely (floor: the
+    non-evictable working set only)."""
     mr = config.max_running_req
     if config.cache_type != "hybrid_radix":
         return mr + 1  # live + dummy/padding
     ratio = config.linear_state_cache_ratio
+    if ratio < 1.0:
+        return 4 * mr + 1  # zero snapshot cache (the _linear_pool_min_slots floor)
     n_cache = max(4, int(ratio * mr))
     return 4 * mr + n_cache + 1  # live + 2 ping-pong + locked committed snapshot + cache + padding
 
