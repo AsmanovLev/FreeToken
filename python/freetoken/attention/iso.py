@@ -121,16 +121,21 @@ class IsoAttentionBackend(BaseAttnBackend):
             # the stock triton flash-decode kernel: O(ctx) with a small constant,
             # ~90x faster at 32k than the packed custom decode kernel.
             self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
-            total = int(metadata.indptr[-1])
-            scratch_bytes = total * kv_heads * head_dim * 2 * 2
             # capture sessions pin buffer shapes at capture time and indptr[-1]
             # is a D2H read (illegal inside a graph) -> graphs always take the
             # packed kernel path
-            free_ok = False
-            if self.capture is None and total > 0 and scratch_bytes <= self._scratch_cap_bytes():
+            fast_ok = self.capture is None
+            total = -1
+            if fast_ok:
+                total = int(metadata.indptr[-1])
+                scratch_bytes = total * kv_heads * head_dim * 2 * 2
                 free_bytes, _ = torch.cuda.mem_get_info(self.device)
-                free_ok = free_bytes > scratch_bytes + 64 * 2**20
-            if free_ok:
+                fast_ok = (
+                    total > 0
+                    and scratch_bytes <= self._scratch_cap_bytes()
+                    and free_bytes > scratch_bytes + 64 * 2**20
+                )
+            if fast_ok:
                 from freetoken.kernel.iso import iso_dequant_rows
                 from freetoken.kernel.triton.attention import decode_paged_attention
 
