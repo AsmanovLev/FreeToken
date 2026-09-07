@@ -6,13 +6,19 @@ import torch
 from freetoken.distributed import get_tp_info
 from freetoken.env import ENV
 from freetoken.models.config import LinearGatedDeltaGroupConfig, SlotStateSpec
-from freetoken.utils import div_even
+from freetoken.utils import div_even, init_logger
+
+logger = init_logger(__name__)
 
 _SSM_DTYPES = {
     "float32": torch.float32,
     "bfloat16": torch.bfloat16,
     "float16": torch.float16,
 }
+
+# Host-snapshot slot ids handed to the radix tree start here (GPU slot ids are
+# always < 1 << 30). The pool routes free/copy on this bit.
+_HOST_ID_BASE = 1 << 30
 
 
 def ssm_state_dtype() -> torch.dtype:
@@ -52,14 +58,29 @@ class LinearStatePool:
         device: torch.device,
         tp_size: int | None = None,
         slot_states: tuple[SlotStateSpec, ...] = (),
+        snapshot_mode: str = "gpu",
     ) -> None:
         if tp_size is None:
             tp_size = get_tp_info().size
+        if snapshot_mode not in ("gpu", "host"):
+            raise ValueError(f"snapshot_mode {snapshot_mode!r} not in ('gpu', 'host')")
 
         self._group = group
         self._num_slots = num_slots
         self._device = device
         self._conv_dtype = dtype
+        self._snapshot_mode = snapshot_mode
+
+        # Host snapshot store (snapshot_mode="host"): tree-donated snapshots live in
+        # pinned host RAM instead of VRAM slots, as lazily-allocated pinned buffers.
+        # VRAM slots then only back the live working set (no ping-pong, no committed
+        # snapshot, no snapshot cache) and the GDN VRAM budget shrinks accordingly
+        # (state_pool_bytes -> _linear_pool_num_slots -> mr + 1).
+        self._host_store: list[dict[str, torch.Tensor] | None] = []
+        self._free_host: list[int] = []
+        # The engine's forward stream; set by the engine via set_engine_stream. D2H
+        # snapshots must be ordered after the forward writes that produced the state.
+        self._engine_stream: torch.cuda.Stream | None = None
 
         n_layers, local_conv_dim, local_v_heads = _linear_local_dims(group, tp_size)
 
@@ -136,6 +157,7 @@ class LinearStatePool:
         CacheManager rebuild that discards the tree owning donated snapshots) must guarantee no
         running request holds a slot, otherwise live state would be handed out twice."""
         self._free_slots = list(range(1, self._num_slots))
+        self._free_host = list(range(len(self._host_store)))
 
     def rebuild(self, num_slots: int) -> None:
         """Reallocate the conv + recurrent state tensors for ``num_slots`` slots IN PLACE.
@@ -167,14 +189,137 @@ class LinearStatePool:
         self.slot_states = self._alloc_slot_states(num_slots)
         self._num_slots = num_slots
         self._free_slots = list(range(1, num_slots))
+        self._free_host = list(range(len(self._host_store)))
 
     def free(self, slots) -> None:
-        """Return slot ids to the free-list. Accepts an int, list, or 1-D tensor."""
+        """Return slot ids to the free-list. Accepts an int, list, or 1-D tensor.
+        Host snapshot ids (>= _HOST_ID_BASE) route to the host store."""
         if isinstance(slots, torch.Tensor):
             slots = slots.flatten().tolist()
         elif isinstance(slots, int):
             slots = [slots]
-        self._free_slots.extend(int(s) for s in slots)
+        vram = []
+        for s in slots:
+            s = int(s)
+            if s >= _HOST_ID_BASE:
+                self._free_host_snapshot(s)
+            else:
+                vram.append(s)
+        self._free_slots.extend(vram)
+
+    # --- host snapshot store (snapshot_mode="host") ---
+
+    @property
+    def snapshot_mode(self) -> str:
+        return self._snapshot_mode
+
+    @property
+    def host_snapshots(self) -> bool:
+        return self._snapshot_mode == "host"
+
+    def set_engine_stream(self, stream: torch.cuda.Stream | None) -> None:
+        """Give the pool the engine's forward stream so snapshot_to_host can order its D2H
+        after the forward writes even when called from the scheduler stream."""
+        self._engine_stream = stream
+
+    @property
+    def num_host_snapshots(self) -> int:
+        return len(self._host_store) - len(self._free_host)
+
+    def host_snapshot_bytes(self) -> int:
+        """Current pinned-RAM footprint of the host snapshot store."""
+        if not self._host_store:
+            return 0
+        return int(sum(
+            t.numel() * t.element_size()
+            for e in self._host_store
+            if e is not None
+            for t in e.values()
+        ))
+
+    def is_host_snapshot(self, slot_id: int) -> bool:
+        return slot_id >= _HOST_ID_BASE
+
+    def _alloc_host_snapshot(self) -> tuple[int, dict[str, torch.Tensor]]:
+        if self._free_host:
+            idx = self._free_host.pop()
+            return idx, self._host_store[idx]
+        idx = len(self._host_store)
+        entry = {
+            "conv": torch.empty(
+                self.conv_states[:, 0].shape,
+                dtype=self.conv_states.dtype, device="cpu", pin_memory=True,
+            ),
+            "rec": torch.empty(
+                self.recurrent_states[:, 0].shape,
+                dtype=self.recurrent_states.dtype, device="cpu", pin_memory=True,
+            ),
+        }
+        for spec in self._slot_specs:
+            entry[spec.name] = torch.empty(
+                self.slot_states[spec.name][:, 0].shape,
+                dtype=self.slot_states[spec.name].dtype, device="cpu", pin_memory=True,
+            )
+        self._host_store.append(entry)
+        return idx, entry
+
+    def _free_host_snapshot(self, host_id: int) -> None:
+        idx = host_id - _HOST_ID_BASE
+        if not (0 <= idx < len(self._host_store)) or self._host_store[idx] is None:
+            raise ValueError(f"invalid host snapshot id {host_id}")
+        if idx in self._free_host:
+            raise ValueError(f"host snapshot {host_id} freed twice")
+        self._free_host.append(idx)
+
+    def snapshot_to_host(self, slot: int) -> int:
+        """D2H the whole-sequence state of VRAM ``slot`` into a pinned snapshot; returns the
+        host id for the tree. The copy is enqueued on the ENGINE stream (where the last
+        forward wrote the state) and -- when the caller runs on a different stream -- awaited
+        before returning, so the live slot can be freed and reused immediately. Costs
+        ~5-10 ms per 60 MB state on a turn boundary (pinned, ~PCIe speed)."""
+        idx, entry = self._alloc_host_snapshot()
+        tensors = [("conv", entry["conv"], self.conv_states),
+                   ("rec", entry["rec"], self.recurrent_states)]
+        tensors += [(s.name, entry[s.name], self.slot_states[s.name]) for s in self._slot_specs]
+
+        def _copy() -> None:
+            for _name, dst, src in tensors:
+                dst.copy_(src[:, slot], non_blocking=True)
+
+        stream = self._engine_stream if self._device.type == "cuda" else None
+        if stream is not None and torch.cuda.current_stream(self._device) != stream:
+            with torch.cuda.stream(stream):
+                _copy()
+            done = torch.cuda.Event()
+            done.record(stream)
+            done.synchronize()
+        else:
+            # already on the engine stream (or CPU): enqueue in order
+            _copy()
+        return _HOST_ID_BASE + idx
+
+    def restore_from_host(self, host_id: int, slot: int) -> None:
+        """H2D a host snapshot back into VRAM ``slot`` (COW-restore of a prefix hit). Enqueued
+        on the engine stream when the caller runs elsewhere (the engine stream consumes the
+        live slot in its next forward, so same-stream ordering is what matters)."""
+        idx = host_id - _HOST_ID_BASE
+        if not (0 <= idx < len(self._host_store)):
+            raise ValueError(f"invalid host snapshot id {host_id}")
+        entry = self._host_store[idx]
+        tensors = [("conv", self.conv_states, entry["conv"]),
+                   ("rec", self.recurrent_states, entry["rec"])]
+        tensors += [(s.name, self.slot_states[s.name], entry[s.name]) for s in self._slot_specs]
+
+        def _copy() -> None:
+            for _name, dst, src in tensors:
+                dst[:, slot].copy_(src, non_blocking=True)
+
+        stream = self._engine_stream if self._device.type == "cuda" else None
+        if stream is not None and torch.cuda.current_stream(self._device) != stream:
+            with torch.cuda.stream(stream):
+                _copy()
+        else:
+            _copy()
 
     def clear_slots(self, slots) -> None:
         """Zero conv + recurrent state at ``slots`` across all linear layers (fresh sequence)."""
@@ -186,8 +331,12 @@ class LinearStatePool:
             self.slot_states[spec.name][:, slots] = spec.fill_value
 
     def copy_from(self, src: int, dst: int) -> None:
-        """Copy a whole-sequence snapshot (conv + recurrent, all layers) from slot ``src`` to
-        ``dst``. Used for COW-on-restore (donated snapshot -> fresh live slot)."""
+        """Copy a whole-sequence snapshot (conv + recurrent, all layers) from ``src`` to
+        ``dst``. Used for COW-on-restore (donated snapshot -> fresh live slot). Host
+        snapshot ids route through the pinned store (H2D); both-VRAM stays D2D."""
+        if src >= _HOST_ID_BASE:
+            self.restore_from_host(src, dst)
+            return
         self.conv_states[:, dst].copy_(self.conv_states[:, src])
         self.recurrent_states[:, dst].copy_(self.recurrent_states[:, src])
         for t in self.slot_states.values():
@@ -282,10 +431,14 @@ def _linear_pool_num_slots(config) -> int:
     (1 live + 2 ping-pong + 1 committed snapshot locked through decode), plus a cross-request
     snapshot cache and a padding sink; naive GDN keeps the old (max_running_req + 1). A
     linear_state_cache_ratio below 1.0 disables the snapshot cache entirely (floor: the
-    non-evictable working set only)."""
+    non-evictable working set only). Host snapshot mode (--linear-state-snapshots host) moves
+    tree snapshots to pinned RAM and drops ping-pong/committed VRAM slots entirely: the pool
+    only backs the live working set (mr + 1)."""
     mr = config.max_running_req
     if config.cache_type != "hybrid_radix":
         return mr + 1  # live + dummy/padding
+    if getattr(config, "linear_state_snapshots", "gpu") == "host":
+        return mr + 1  # live + padding; snapshots live in pinned RAM
     ratio = config.linear_state_cache_ratio
     if ratio < 1.0:
         return 4 * mr + 1  # zero snapshot cache (the _linear_pool_min_slots floor)
@@ -301,5 +454,7 @@ def _linear_pool_min_slots(config) -> int:
     deadlocks -- so a runtime rebuild rejects a smaller request."""
     mr = config.max_running_req
     if config.cache_type != "hybrid_radix":
+        return mr + 1
+    if getattr(config, "linear_state_snapshots", "gpu") == "host":
         return mr + 1
     return 4 * mr + 1

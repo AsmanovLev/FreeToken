@@ -404,6 +404,18 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--linear-state-snapshots",
+        type=str,
+        choices=["gpu", "host"],
+        default=ServerArgs.linear_state_snapshots,
+        help="Hybrid GDN models: where finished-request snapshots live. 'gpu' (default) "
+        "keeps them in the VRAM slot pool with mid-prefill tracking; 'host' moves them to "
+        "pinned host memory (~60 MB/slot) and drops the extra VRAM slots "
+        "(max_running_req + 1 remain), freeing ~180 MB -- use for large contexts on "
+        "small GPUs. Snapshot/restore happen at request boundaries (~10 ms each).",
+    )
+
+    parser.add_argument(
         "--enable-cache-report",
         action="store_true",
         default=ServerArgs.enable_cache_report,

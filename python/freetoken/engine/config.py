@@ -67,6 +67,13 @@ class EngineConfig:
     # `--cache-type naive` opts out. linear_state_cache_ratio sizes the GDN snapshot cache as
     # ceil(ratio * max_running_req) extra slots.
     linear_state_cache_ratio: float = 2.0
+    # Where finished-request GDN snapshots live for hybrid_radix: "gpu" keeps them in the
+    # VRAM slot pool (ping-pong mid-prefill tracking active); "host" stores them in pinned
+    # host memory (D2H/H2D on the engine stream at request boundaries, ~60 MB/slot) and
+    # drops the ping-pong/committed VRAM slots entirely (num_slots = max_running_req + 1).
+    # Frees ~180 MB of VRAM at max_running_req 1 -- the enabler for 64k+ context on small
+    # GPUs -- at the cost of losing mid-prefill snapshot granularity.
+    linear_state_snapshots: str = "gpu"
     # Window/full ratio for the SWA radix cache (`--cache-type radix` on SWA models) and the DSV4
     # window tier: the DEFAULT window-pool size = max(working-set floor, ratio x full-pool tokens).
     # < 1.0 trades retained window-prefix capacity for memory savings; must be in (0, 1]. It is the

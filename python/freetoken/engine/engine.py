@@ -404,7 +404,9 @@ class Engine:
                 device=self.device,
                 tp_size=config.tp_info.size,
                 slot_states=config.model_config.slot_states,
+                snapshot_mode=getattr(config, "linear_state_snapshots", "gpu"),
             )
+            self.linear_state_pool.set_engine_stream(self.stream)
             self.ctx.linear_state_pool = self.linear_state_pool
         else:
             self.linear_state_pool = None
