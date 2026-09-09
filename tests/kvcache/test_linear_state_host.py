@@ -124,7 +124,7 @@ def test_num_slots_formula():
     c = C()
     assert _linear_pool_num_slots(c) == 4 * 1 + 4 + 1
     c.linear_state_snapshots = "host"
-    assert _linear_pool_num_slots(c) == 1 + 1
+    assert _linear_pool_num_slots(c) == 2 * 1 + 2
     c.cache_type = "naive"
     assert _linear_pool_num_slots(c) == 1 + 1
 

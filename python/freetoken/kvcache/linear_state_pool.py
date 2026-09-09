@@ -273,29 +273,23 @@ class LinearStatePool:
 
     def snapshot_to_host(self, slot: int) -> int:
         """D2H the whole-sequence state of VRAM ``slot`` into a pinned snapshot; returns the
-        host id for the tree. The copy is enqueued on the ENGINE stream (where the last
-        forward wrote the state) and -- when the caller runs on a different stream -- awaited
-        before returning, so the live slot can be freed and reused immediately. Costs
-        ~5-10 ms per 60 MB state on a turn boundary (pinned, ~PCIe speed)."""
+        host id for the tree. The copy runs on the CALLER's current stream: cache_req is
+        invoked from the scheduler loop after its cross-stream wait against the engine
+        stream, so the source state is final, and every later writer of the slot or the
+        host entry is enqueued on that same scheduler stream behind this copy (FIFO).
+        No inline event waits: the scheduler thread drives both streams' waits, an inline
+        synchronize here deadlocks (observed in overlap_loop wait_stream)."""
         idx, entry = self._alloc_host_snapshot()
         tensors = [("conv", entry["conv"], self.conv_states),
                    ("rec", entry["rec"], self.recurrent_states)]
         tensors += [(s.name, entry[s.name], self.slot_states[s.name]) for s in self._slot_specs]
-
-        def _copy() -> None:
-            for _name, dst, src in tensors:
-                dst.copy_(src[:, slot], non_blocking=True)
-
-        stream = self._engine_stream if self._device.type == "cuda" else None
-        if stream is not None and torch.cuda.current_stream(self._device) != stream:
-            with torch.cuda.stream(stream):
-                _copy()
-            done = torch.cuda.Event()
-            done.record(stream)
-            done.synchronize()
-        else:
-            # already on the engine stream (or CPU): enqueue in order
-            _copy()
+        for _name, dst, src in tensors:
+            # copy per leading layer: src[:, slot] is a strided view (non-contiguous), and
+            # a whole-view D2H would materialize a contiguous staging copy on the GPU
+            # (~60 MB on Qwen3.5 -- OOM on tight budgets). Per-layer tail slices are
+            # contiguous views -> straight D2H, no staging.
+            for l in range(src.shape[0]):
+                dst[l].copy_(src[l, slot], non_blocking=True)
         return _HOST_ID_BASE + idx
 
     def restore_from_host(self, host_id: int, slot: int) -> None:
@@ -310,16 +304,8 @@ class LinearStatePool:
                    ("rec", self.recurrent_states, entry["rec"])]
         tensors += [(s.name, self.slot_states[s.name], entry[s.name]) for s in self._slot_specs]
 
-        def _copy() -> None:
-            for _name, dst, src in tensors:
-                dst[:, slot].copy_(src, non_blocking=True)
-
-        stream = self._engine_stream if self._device.type == "cuda" else None
-        if stream is not None and torch.cuda.current_stream(self._device) != stream:
-            with torch.cuda.stream(stream):
-                _copy()
-        else:
-            _copy()
+        for _name, dst, src in tensors:
+            dst[:, slot].copy_(src, non_blocking=True)
 
     def clear_slots(self, slots) -> None:
         """Zero conv + recurrent state at ``slots`` across all linear layers (fresh sequence)."""
@@ -432,13 +418,15 @@ def _linear_pool_num_slots(config) -> int:
     snapshot cache and a padding sink; naive GDN keeps the old (max_running_req + 1). A
     linear_state_cache_ratio below 1.0 disables the snapshot cache entirely (floor: the
     non-evictable working set only). Host snapshot mode (--linear-state-snapshots host) moves
-    tree snapshots to pinned RAM and drops ping-pong/committed VRAM slots entirely: the pool
-    only backs the live working set (mr + 1)."""
+    tree snapshots to pinned RAM: the pool backs live + ping-pong only (2*mr + 1) -- the
+    kernel still writes mid-chunk snapshots into the ping-pong slots, chunk commits donate
+    HOST copies and hand the VRAM slot straight back."""
     mr = config.max_running_req
     if config.cache_type != "hybrid_radix":
         return mr + 1  # live + dummy/padding
     if getattr(config, "linear_state_snapshots", "gpu") == "host":
-        return mr + 1  # live + padding; snapshots live in pinned RAM
+        # padding + live + 2 ping-pong per request; the tree never holds VRAM slots
+        return 2 * mr + 2
     ratio = config.linear_state_cache_ratio
     if ratio < 1.0:
         return 4 * mr + 1  # zero snapshot cache (the _linear_pool_min_slots floor)
