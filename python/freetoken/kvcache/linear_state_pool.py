@@ -12,8 +12,11 @@ logger = init_logger(__name__)
 
 _SSM_DTYPES = {
     "float32": torch.float32,
+    "fp32": torch.float32,
     "bfloat16": torch.bfloat16,
+    "bf16": torch.bfloat16,
     "float16": torch.float16,
+    "fp16": torch.float16,
 }
 
 # Host-snapshot slot ids handed to the radix tree start here (GPU slot ids are
