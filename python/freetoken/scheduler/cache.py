@@ -425,6 +425,31 @@ class CacheManager:
             return
         frozen_idx = 1 - req.mamba_next_track_idx          # the slot the forward just wrote
         frozen = req.mamba_ping_pong[frozen_idx]
+        if pool.host_snapshots:
+            # donate a HOST copy of the frozen slot: mid-chunk x64 snapshots keep their
+            # reuse granularity (match_prefix truncates to the deepest live-snapshot
+            # boundary, so a tree without them degrades to end-of-turn reuse), while the
+            # tree still holds no VRAM slots. The D2H runs on the engine stream; the VRAM
+            # slot returns to the pool right after (the frozen copy lives in pinned RAM).
+            host_id = pool.snapshot_to_host(frozen)
+            prefix_len, mamba_exist = self.prefix_cache.insert(
+                req.input_ids[:L], page_indices[:L], host_id)
+            if mamba_exist:
+                pool.free([host_id])                       # dedup: tree kept its own copy
+            pool.free([frozen])
+            self.unlock(old_handle)
+            self._free(page_indices[old_handle.cached_len : prefix_len])
+            m = self.prefix_cache.match_prefix(req.input_ids[:L])
+            if prefix_len > old_handle.cached_len:
+                self.page_table[req.table_idx, old_handle.cached_len : prefix_len].copy_(
+                    m.kv_indices[old_handle.cached_len : prefix_len])
+            req.cache_handle = HybridCacheHandle(m.cached_len, m.node, m.kv_indices)
+            self.lock(req.cache_handle)
+            pp = list(req.mamba_ping_pong)
+            pp[frozen_idx] = pool.alloc(1)[0]
+            req.mamba_ping_pong = tuple(pp)
+            req.mamba_last_track_seqlen = None
+            return
         prefix_len, mamba_exist = self.prefix_cache.insert(
             req.input_ids[:L], page_indices[:L], frozen)
         self.unlock(old_handle)
