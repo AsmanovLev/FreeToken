@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from freetoken.kernel import iso
+from freetoken.kernel.triton.attention import decode_paged_attention
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
 
@@ -129,3 +130,48 @@ def test_extend(fmt, hq, hkv, d):
         got = out[qs_ : qs_ + nw].float().view(nw, hq, d)
         cos = torch.nn.functional.cosine_similarity(ref.reshape(-1), got.reshape(-1), dim=0)
         assert cos > 0.9999, f"extend req{r} vs dequant-oracle cos={cos}"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
+@pytest.mark.parametrize("fmt", ["iso3", "iso4"])
+def test_chunked_decode(fmt):
+    """Context > scratch: chunked decode with LSE merge == one-shot decode."""
+    from freetoken.attention.iso import chunked_decode
+
+    torch.manual_seed(12)
+    dev = "cuda"
+    hq, hkv, d = 8, 2, 128
+    total = 3000
+    rb = iso.packed_row_bytes(d, fmt)
+    kc = torch.zeros(total + 8, hkv * rb, dtype=torch.uint8, device=dev)
+    vc = torch.zeros_like(kc)
+    k = (torch.randn(total, hkv, d, device=dev) * 2).to(torch.bfloat16)
+    v = (torch.randn(total, hkv, d, device=dev) * 2).to(torch.bfloat16)
+    idx = torch.arange(total, dtype=torch.int32, device=dev)
+    iso.iso_store_cache(kc, vc, idx, k.view(total, -1), v.view(total, -1),
+                        hkv, d, fmt)
+    torch.cuda.synchronize()
+
+    indptr = torch.tensor([0, total], dtype=torch.int32, device=dev)
+    q = torch.randn(1, hq, d, device=dev).to(torch.bfloat16)
+    scale = d ** -0.5
+    q_pos = torch.tensor([total - 1], dtype=torch.int32, device=dev)
+
+    kd, vd = iso.iso_dequant_rows(kc, vc, idx, hkv, d, fmt)
+    al = torch.empty(1, hq, 8, d, dtype=torch.float32, device=dev)
+    lse = torch.empty(1, hq, 8, dtype=torch.float32, device=dev)
+    splits = torch.full((1,), 8, dtype=torch.int32, device=dev)
+    ref = decode_paged_attention(
+        q=q, k_cache=kd.view(total, hkv, d), v_cache=vd.view(total, hkv, d),
+        indptr=indptr, indices=idx, q_positions=q_pos, attn_logits=al,
+        attn_lse=lse, num_kv_splits=splits, max_kv_splits=8, sm_scale=scale)
+
+    ct = 1024  # 3 chunks
+    scratch = (torch.empty(ct, hkv, d, dtype=torch.bfloat16, device=dev),
+               torch.empty(ct, hkv, d, dtype=torch.bfloat16, device=dev))
+    out = torch.empty_like(q)
+    chunked_decode(q, out, kc, vc, indptr, idx, hq, hkv, d, scale, q_pos,
+                   scratch, ct, fmt)
+    cos = torch.nn.functional.cosine_similarity(
+        ref.reshape(-1).float(), out.reshape(-1).float(), dim=0)
+    assert cos > 0.9995, f"chunked vs one-shot cos={cos}"

@@ -26,6 +26,75 @@ if TYPE_CHECKING:
 
 
 
+def chunked_decode(
+    q: torch.Tensor,
+    out: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_indices: torch.Tensor,
+    nheads_q: int,
+    nheads_kv: int,
+    head_dim: int,
+    scale: float,
+    q_positions: torch.Tensor,
+    scratch: tuple[torch.Tensor, torch.Tensor],
+    scratch_tokens: int,
+    fmt: str,
+) -> None:
+    """Decode attention over a context LARGER than the dequant scratch.
+
+    Splits the packed context into scratch-sized chunks; each chunk is
+    dequantized into the shared scratch and served by the triton split-k
+    decode kernel (one "split" per chunk), then the per-chunk partials are
+    merged with the standard online-softmax (LSE) combination -- identical
+    math to the kernel's own split-k combine. ``scratch`` holds
+    (k, v) buffers of ``scratch_tokens`` rows each; rows are positional
+    (scratch row j == global token chunk_start + j).
+    """
+    from freetoken.kernel.iso import iso_dequant_rows
+    from freetoken.kernel.triton.attention import decode_paged_attention
+
+    n, nq, d = q.shape
+    total = int(kv_indptr[-1])
+    ct = max(1, min(scratch_tokens, total))
+    n_chunks = (total + ct - 1) // ct
+
+    logits = torch.zeros(n, nq, n_chunks, d, dtype=torch.float32, device=q.device)
+    lse = torch.full((n, nq, n_chunks), float("-inf"), dtype=torch.float32,
+                     device=q.device)
+    device = q.device
+    idx_buf = torch.arange(ct, dtype=torch.int32, device=device)
+    ones = torch.ones(n, dtype=torch.int32, device=device)
+    sk, sv = scratch
+    for c in range(n_chunks):
+        lo, hi = c * ct, min((c + 1) * ct, total)
+        size = hi - lo
+        iso_dequant_rows(
+            k_cache, v_cache, kv_indices[lo:hi], nheads_kv, head_dim, fmt,
+            out=(sk[:size].view(size, -1), sv[:size].view(size, -1)),
+        )
+        indptr_c = (kv_indptr - lo).clamp_(0, size).to(torch.int32)
+        decode_paged_attention(
+            q=q,
+            k_cache=sk[:size],
+            v_cache=sv[:size],
+            indptr=indptr_c,
+            indices=idx_buf[:size],
+            q_positions=q_positions,
+            attn_logits=logits[:, :, c : c + 1],
+            attn_lse=lse[:, :, c : c + 1],
+            num_kv_splits=ones,
+            max_kv_splits=1,
+            sm_scale=scale,
+        )
+
+    m = lse.max(dim=-1).values                       # [n, nq]
+    w = (lse - m.unsqueeze(-1)).exp()                # [n, nq, C]
+    merged = (logits * w.unsqueeze(-1)).sum(dim=2) / w.sum(dim=-1)[..., None]
+    out.copy_(merged.to(out.dtype).view(n, nq, d))
+
+
 @dataclass
 class IsoCaptureData(BaseCaptureData):
     @classmethod
@@ -86,6 +155,54 @@ class IsoAttentionBackend(BaseAttnBackend):
 
         return int(os.environ.get("FREETOKEN_ISO_SCRATCH_MB", "128")) * 2**20
 
+    @staticmethod
+    def _scratch_tokens(kv_heads: int, head_dim: int) -> int:
+        """How many context rows of dequantized K/V (bf16, K + V) fit in the
+        scratch budget: the chunk size of the chunked decode path."""
+        return max(1, IsoAttentionBackend._scratch_cap_bytes()
+                   // (kv_heads * head_dim * 2 * 2))
+
+    def _decode_small_context(self, q, k_flat, v_flat, metadata, kv_heads,
+                              head_dim, scale, n, nq, total):
+        """One-shot decode: the whole context fits the scratch budget."""
+        from freetoken.kernel.iso import iso_dequant_rows
+        from freetoken.kernel.triton.attention import decode_paged_attention
+
+        if self._decode_scratch is None or self._decode_max_ctx < total:
+            self._decode_scratch = (
+                torch.empty(total, kv_heads, head_dim,
+                            dtype=torch.bfloat16, device=self.device),
+                torch.empty(total, kv_heads, head_dim,
+                            dtype=torch.bfloat16, device=self.device),
+            )
+            self._decode_max_ctx = total
+        sk, sv = self._decode_scratch
+        iso_dequant_rows(
+            k_flat, v_flat, metadata.indices, kv_heads, head_dim,
+            self.iso_fmt,
+            out=(sk[:total].view(total, -1), sv[:total].view(total, -1)),
+        )
+        if self._decode_indices is None or self._decode_indices.numel() < total:
+            self._decode_indices = torch.arange(
+                total, dtype=torch.int32, device=self.device)
+        attn_logits = torch.empty(
+            (n, nq, 8, head_dim), dtype=torch.float32, device=self.device)
+        attn_lse = torch.empty((n, nq, 8), dtype=torch.float32, device=self.device)
+        num_kv_splits = torch.full((n,), 8, dtype=torch.int32, device=self.device)
+        return decode_paged_attention(
+            q=q,
+            k_cache=sk[:total],
+            v_cache=sv[:total],
+            indptr=metadata.indptr,
+            indices=self._decode_indices[:total],
+            q_positions=metadata.q_positions,
+            attn_logits=attn_logits,
+            attn_lse=attn_lse,
+            num_kv_splits=num_kv_splits,
+            max_kv_splits=8,
+            sm_scale=scale,
+        )
+
     def forward(
         self,
         q: torch.Tensor,
@@ -124,62 +241,37 @@ class IsoAttentionBackend(BaseAttnBackend):
             # capture sessions pin buffer shapes at capture time and indptr[-1]
             # is a D2H read (illegal inside a graph) -> graphs always take the
             # packed kernel path
-            fast_ok = self.capture is None
-            total = -1
-            if fast_ok:
+            if self.capture is None and n == 1:
                 total = int(metadata.indptr[-1])
-                scratch_bytes = total * kv_heads * head_dim * 2 * 2
-                free_bytes, _ = torch.cuda.mem_get_info(self.device)
-                # 2x scratch: the first allocation may itself need to grow the
-                # allocator pool; the rest is the triton decode workspace
-                fast_ok = (
-                    total > 0
-                    and scratch_bytes <= self._scratch_cap_bytes()
-                    and free_bytes > 2 * scratch_bytes + 64 * 2**20
-                )
-            if fast_ok:
-                from freetoken.kernel.iso import iso_dequant_rows
-                from freetoken.kernel.triton.attention import decode_paged_attention
-
-                total_kv, max_splits = total, 8
-                # grow the reused scratch to cover this context; the dequant
-                # writes STRAIGHT into it (no transient kd/vd on the side --
-                # at 48k ctx a transient pair costs another ~100 MB)
-                if self._decode_scratch is None or self._decode_max_ctx < total_kv:
-                    self._decode_scratch = (
-                        torch.empty(total_kv, kv_heads, head_dim,
-                                    dtype=torch.bfloat16, device=self.device),
-                        torch.empty(total_kv, kv_heads, head_dim,
-                                    dtype=torch.bfloat16, device=self.device),
-                    )
-                    self._decode_max_ctx = total_kv
-                sk, sv = self._decode_scratch
-                iso_dequant_rows(
-                    k_flat, v_flat, metadata.indices, kv_heads, head_dim,
-                    self.iso_fmt,
-                    out=(sk[:total_kv].view(total_kv, -1),
-                         sv[:total_kv].view(total_kv, -1)),
-                )
-                if self._decode_indices is None or self._decode_indices.numel() < total_kv:
-                    self._decode_indices = torch.arange(
-                        total_kv, dtype=torch.int32, device=self.device)
-                attn_logits = torch.empty(
-                    (n, nq, 8, head_dim), dtype=torch.float32, device=self.device)
-                attn_lse = torch.empty((n, nq, 8), dtype=torch.float32, device=self.device)
-                num_kv_splits = torch.full((n,), 8, dtype=torch.int32, device=self.device)
-                return decode_paged_attention(
-                    q=q,
-                    k_cache=sk[:total_kv],
-                    v_cache=sv[:total_kv],
-                    indptr=metadata.indptr,
-                    indices=self._decode_indices[:total_kv],
-                    q_positions=metadata.q_positions,
-                    attn_logits=attn_logits,
-                    attn_lse=attn_lse,
-                    num_kv_splits=num_kv_splits,
-                    max_kv_splits=8,
-                    sm_scale=scale,
-                )
+                if total > 0:
+                    ct = self._scratch_tokens(kv_heads, head_dim)
+                    free_bytes, _ = torch.cuda.mem_get_info(self.device)
+                    scratch_bytes = ct * kv_heads * head_dim * 2 * 2
+                    if ct >= total and free_bytes > 2 * scratch_bytes + 64 * 2**20:
+                        return self._decode_small_context(
+                            q, k_flat, v_flat, metadata, kv_heads, head_dim,
+                            scale, n, nq, total)
+                    if free_bytes > 2 * scratch_bytes + 64 * 2**20:
+                        # context larger than the scratch budget: serve it in
+                        # scratch-sized chunks and merge partials by LSE (same
+                        # math as the triton kernel's own split-k combine) --
+                        # full-speed decode at ANY context length
+                        if self._decode_scratch is None or self._decode_max_ctx < ct:
+                            self._decode_scratch = (
+                                torch.empty(ct, kv_heads, head_dim,
+                                            dtype=torch.bfloat16, device=self.device),
+                                torch.empty(ct, kv_heads, head_dim,
+                                            dtype=torch.bfloat16, device=self.device),
+                            )
+                            self._decode_max_ctx = ct
+                        out = torch.empty_like(q)
+                        chunked_decode(
+                            q, out, k_flat, v_flat, metadata.indptr,
+                            metadata.indices, nq, kv_heads, head_dim, scale,
+                            metadata.q_positions, self._decode_scratch, ct,
+                            self.iso_fmt,
+                        )
+                        return out
             out = torch.empty_like(q)
             iso_attention_decode(
                 q.reshape(n, -1), out.reshape(n, -1), k_flat, v_flat,
