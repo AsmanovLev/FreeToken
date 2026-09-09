@@ -273,12 +273,21 @@ def iso_dequant_rows(
     nheads: int,
     head_dim: int,
     fmt: str,
+    out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Dequantize packed rows back to (N, nheads*head_dim) bf16 (debug/tests)."""
+    """Dequantize packed rows back to (N, nheads*head_dim) bf16 (debug/tests).
+
+    ``out`` optionally supplies preallocated (k, v) destination tensors shaped
+    (N, nheads*head_dim); the caller (attention backend decode path) uses this
+    to dequantize straight into its reused scratch, avoiding the transient
+    kd/vd allocation on tight-VRAM servers."""
     check_format(fmt)
     n = indices.numel()
-    k = torch.empty(n, nheads * head_dim, dtype=torch.bfloat16, device=k_cache.device)
-    v = torch.empty(n, nheads * head_dim, dtype=torch.bfloat16, device=k_cache.device)
+    if out is None:
+        k = torch.empty(n, nheads * head_dim, dtype=torch.bfloat16, device=k_cache.device)
+        v = torch.empty(n, nheads * head_dim, dtype=torch.bfloat16, device=k_cache.device)
+    else:
+        k, v = out
     _iso_module(fmt).dequant(k, v, k_cache, v_cache, indices, nheads, head_dim)
     return k, v
 

@@ -305,7 +305,12 @@ class LinearStatePool:
         tensors += [(s.name, self.slot_states[s.name], entry[s.name]) for s in self._slot_specs]
 
         for _name, dst, src in tensors:
-            dst[:, slot].copy_(src, non_blocking=True)
+            # per-LAYER copy: dst[:, slot] is a strided column view and an H2D
+            # into it materializes a contiguous GPU staging buffer (~60 MB --
+            # OOM on ~50 MB-free servers); dst[l, slot] tail slices are
+            # contiguous views, so each layer copies staging-free.
+            for l in range(dst.shape[0]):
+                dst[l, slot].copy_(src[l], non_blocking=True)
 
     def clear_slots(self, slots) -> None:
         """Zero conv + recurrent state at ``slots`` across all linear layers (fresh sequence)."""

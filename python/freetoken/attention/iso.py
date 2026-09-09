@@ -130,20 +130,21 @@ class IsoAttentionBackend(BaseAttnBackend):
                 total = int(metadata.indptr[-1])
                 scratch_bytes = total * kv_heads * head_dim * 2 * 2
                 free_bytes, _ = torch.cuda.mem_get_info(self.device)
+                # 2x scratch: the first allocation may itself need to grow the
+                # allocator pool; the rest is the triton decode workspace
                 fast_ok = (
                     total > 0
                     and scratch_bytes <= self._scratch_cap_bytes()
-                    and free_bytes > scratch_bytes + 64 * 2**20
+                    and free_bytes > 2 * scratch_bytes + 64 * 2**20
                 )
             if fast_ok:
                 from freetoken.kernel.iso import iso_dequant_rows
                 from freetoken.kernel.triton.attention import decode_paged_attention
 
-                kd, vd = iso_dequant_rows(
-                    k_flat, v_flat, metadata.indices, kv_heads, head_dim,
-                    self.iso_fmt,
-                )
                 total_kv, max_splits = total, 8
+                # grow the reused scratch to cover this context; the dequant
+                # writes STRAIGHT into it (no transient kd/vd on the side --
+                # at 48k ctx a transient pair costs another ~100 MB)
                 if self._decode_scratch is None or self._decode_max_ctx < total_kv:
                     self._decode_scratch = (
                         torch.empty(total_kv, kv_heads, head_dim,
@@ -152,10 +153,13 @@ class IsoAttentionBackend(BaseAttnBackend):
                                     dtype=torch.bfloat16, device=self.device),
                     )
                     self._decode_max_ctx = total_kv
-                assert self._decode_scratch is not None
-                self._decode_scratch[0][:total_kv].copy_(kd.view(total_kv, kv_heads, head_dim))
-                self._decode_scratch[1][:total_kv].copy_(vd.view(total_kv, kv_heads, head_dim))
                 sk, sv = self._decode_scratch
+                iso_dequant_rows(
+                    k_flat, v_flat, metadata.indices, kv_heads, head_dim,
+                    self.iso_fmt,
+                    out=(sk[:total_kv].view(total_kv, -1),
+                         sv[:total_kv].view(total_kv, -1)),
+                )
                 if self._decode_indices is None or self._decode_indices.numel() < total_kv:
                     self._decode_indices = torch.arange(
                         total_kv, dtype=torch.int32, device=self.device)
@@ -190,18 +194,40 @@ class IsoAttentionBackend(BaseAttnBackend):
         # O(prefix) dequant per layer instead of per-query dequant.
         prefix_total = metadata.prefix_total
         scratch_bytes = prefix_total * kv_heads * head_dim * 2 * 2
-        if prefix_total > 0 and scratch_bytes <= self._scratch_cap_bytes():
+        free_bytes, _ = torch.cuda.mem_get_info(self.device)
+        # same live-VRAM guard as the decode path: the dequant scratch + triton
+        # workspace must fit with headroom (2x scratch + 64 MB), otherwise the
+        # packed CUDA extend kernel runs (no scratch at all)
+        fast_ok = (
+            prefix_total > 0
+            and scratch_bytes <= self._scratch_cap_bytes()
+            and free_bytes > 2 * scratch_bytes + 64 * 2**20
+        )
+        if fast_ok:
             from freetoken.kernel.iso import iso_dequant_rows
             from freetoken.kernel.triton.attention import extend_paged_attention
 
-            kd, vd = iso_dequant_rows(
+            # grow the reused scratch (shared with the decode path) and
+            # dequantize STRAIGHT into it -- no transient kd/vd allocations
+            if self._decode_scratch is None or self._decode_max_ctx < prefix_total:
+                self._decode_scratch = (
+                    torch.empty(prefix_total, kv_heads, head_dim,
+                                dtype=torch.bfloat16, device=self.device),
+                    torch.empty(prefix_total, kv_heads, head_dim,
+                                dtype=torch.bfloat16, device=self.device),
+                )
+                self._decode_max_ctx = prefix_total
+            sk, sv = self._decode_scratch
+            iso_dequant_rows(
                 k_flat, v_flat, metadata.prefix_indices, kv_heads, head_dim,
                 self.iso_fmt,
+                out=(sk[:prefix_total].view(prefix_total, -1),
+                     sv[:prefix_total].view(prefix_total, -1)),
             )
             out = extend_paged_attention(
                 q=q,
-                k_cache=kd.view(prefix_total, kv_heads, head_dim),
-                v_cache=vd.view(prefix_total, kv_heads, head_dim),
+                k_cache=sk[:prefix_total],
+                v_cache=sv[:prefix_total],
                 qo_indptr=metadata.cu_seqlens_q_gpu,
                 kv_indptr=metadata.indptr,
                 kv_indices=metadata.scratch_indices,
