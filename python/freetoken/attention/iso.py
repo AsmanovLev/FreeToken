@@ -127,6 +127,90 @@ class IsoMetadata(BaseAttnMetadata):
         return self.cu_seqlens_q_gpu[1 : 1 + bs] - 1
 
 
+
+def iso_extend_chunked(
+    q: torch.Tensor,
+    out: torch.Tensor,
+    k_flat: torch.Tensor,
+    v_flat: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    prefix_indices: torch.Tensor,
+    k_ext: torch.Tensor,
+    v_ext: torch.Tensor,
+    max_q_len: int,
+    scale: float,
+    fmt: str,
+    scratch: tuple[torch.Tensor, torch.Tensor],
+    indices_buf: torch.Tensor,
+    lse_buf: torch.Tensor,
+    ct: int,
+) -> None:
+    """Extend attention against a packed prefix too large for the one-shot
+    scratch: the prefix is served in ``ct``-row chunks (each dequantized in
+    place and attended with the non-causal triton extend kernel), plus one
+    causal pass over the bf16 extend rows; the partials merge by LSE. The
+    extend rows are re-attended once (empty-prefix split-kernel pass), not
+    per chunk, so no softmax mass is double-counted.
+
+    ``scratch`` is (k, v) bf16 [ct, kv_heads, head_dim] reused across layers;
+    ``indices_buf`` is arange(ct, int32) (chunk rows are dense scratch ids);
+    ``lse_buf`` is [n, nq] fp32 scratch. Writes ``out`` ([n, nq, head_dim] bf16).
+    """
+    from freetoken.kernel.iso import iso_dequant_rows
+    from freetoken.kernel.triton.attention import extend_paged_attention
+
+    sk, sv = scratch
+    n, nq = q.shape[0], q.shape[1]
+    pt = prefix_indices.numel()
+    kv_heads, head_dim = sk.shape[1], sk.shape[2]
+    R = kv_indptr.numel() - 1
+    zero_indptr = torch.zeros(R + 1, dtype=torch.int32, device=q.device)
+    zero_lens = torch.zeros(R, dtype=torch.int32, device=q.device)
+    empty_idx = indices_buf[:0]
+    acc = torch.zeros(n, nq, head_dim, dtype=torch.float32, device=q.device)
+    lsum = torch.zeros(n, nq, dtype=torch.float32, device=q.device)
+    run_max = torch.full((n, nq), float("-inf"), dtype=torch.float32, device=q.device)
+
+    def merge(o_p: torch.Tensor, lse_p: torch.Tensor) -> None:
+        nonlocal acc, lsum, run_max
+        l_new = torch.maximum(run_max, lse_p)
+        # both -inf -> weight 0 (avoids inf - inf = nan)
+        w_old = torch.where(run_max == float("-inf"), 0.0, torch.exp(run_max - l_new))
+        w_p = torch.where(lse_p == float("-inf"), 0.0, torch.exp(lse_p - l_new))
+        acc.mul_(w_old.unsqueeze(-1)).add_(o_p.float() * w_p.unsqueeze(-1))
+        lsum.mul_(w_old).add_(w_p)
+        run_max = l_new
+
+    for c0 in range(0, pt, ct):
+        c1 = min(c0 + ct, pt)
+        m = c1 - c0
+        iso_dequant_rows(
+            k_flat, v_flat, prefix_indices[c0:c1], kv_heads, head_dim, fmt,
+            out=(sk[:m].view(m, -1), sv[:m].view(m, -1)),
+        )
+        chunk_indptr = (kv_indptr.clamp(c0, c1) - c0).to(torch.int32)
+        chunk_lens = (chunk_indptr[1:] - chunk_indptr[:-1]).contiguous()
+        o_p = extend_paged_attention(
+            q=q, k_cache=sk[:m], v_cache=sv[:m], qo_indptr=cu_seqlens_q,
+            kv_indptr=chunk_indptr, kv_indices=indices_buf[:m],
+            prefix_lens=chunk_lens, max_q_len=max_q_len, sm_scale=scale,
+            lse_out=lse_buf,
+        )
+        merge(o_p, lse_buf)
+
+    # causal extend partial: empty prefix, split kernel handles the causal
+    # bf16 extend rows only
+    o_e = extend_paged_attention(
+        q=q, k_cache=sk[:0], v_cache=sv[:0], qo_indptr=cu_seqlens_q,
+        kv_indptr=zero_indptr, kv_indices=empty_idx, prefix_lens=zero_lens,
+        max_q_len=max_q_len, sm_scale=scale,
+        k_extend=k_ext, v_extend=v_ext, lse_out=lse_buf,
+    )
+    merge(o_e, lse_buf)
+    out.copy_((acc / lsum.clamp_min(1e-30).unsqueeze(-1)).to(out.dtype))
+
+
 class IsoAttentionBackend(BaseAttnBackend):
     def __init__(self, config: ModelConfig):
         self.config = config
@@ -145,7 +229,27 @@ class IsoAttentionBackend(BaseAttnBackend):
         # dense bf16 decode scratch (k, v) grown on demand; reused across layers
         self._decode_scratch: tuple[torch.Tensor, torch.Tensor] | None = None
         self._decode_indices: torch.Tensor | None = None
+        self._extend_lse: torch.Tensor | None = None
         self._decode_max_ctx = 0
+
+    def _extend_chunk_rows(self, kv_heads: int, head_dim: int) -> int:
+        """Chunk rows for the chunked extend path: live-VRAM sized (free +
+        unused-reserved, minus 96 MB of triton workspace headroom), pinned by
+        FREETOKEN_ISO_EXTEND_CT for debugging/tests. The caller falls back to
+        the packed kernel below a 4096-row floor."""
+        import os
+
+        pinned = os.environ.get("FREETOKEN_ISO_EXTEND_CT")
+        if pinned:
+            return max(1, int(pinned))
+        try:
+            free_d, _total = torch.cuda.mem_get_info(self.device)
+            cached = torch.cuda.memory_reserved(self.device) - \
+                torch.cuda.memory_allocated(self.device)
+        except Exception:
+            return 0
+        row = kv_heads * head_dim * 2 * 2  # K + V bf16
+        return int((free_d + max(0, cached) - 96 * 2**20) // row)
 
     @staticmethod
     def _scratch_cap_bytes() -> int:
@@ -212,7 +316,7 @@ class IsoAttentionBackend(BaseAttnBackend):
         batch: Batch,
         attn_spec: AttentionSpec | None = None,
     ) -> torch.Tensor:
-        from freetoken.kernel.iso import iso_attention_decode, iso_attention_extend
+        from freetoken.kernel.iso import iso_attention_decode, iso_attention_extend  # noqa: F401
 
         metadata = batch.attn_metadata
         assert isinstance(metadata, IsoMetadata)
@@ -365,14 +469,47 @@ class IsoAttentionBackend(BaseAttnBackend):
                 v_extend=v.reshape(n, kv_heads, head_dim),
             )
         else:
-            out = torch.empty_like(q)
-            iso_attention_extend(
-                q.reshape(n, -1), out.reshape(n, -1), k_flat, v_flat,
-                k.reshape(n, -1), v.reshape(n, -1),
-                metadata.cu_seqlens_q_gpu, metadata.prefix_indptr,
-                metadata.prefix_indices,
-                nq, kv_heads, head_dim, scale, metadata.max_q_len, self.iso_fmt,
-            )
+            # chunked: prefix slices through a fixed scratch (VRAM-sized, not
+            # prefix-sized), each served by the triton extend kernel, partials
+            # merged by LSE -- flat rate at any prefix length. Falls back to
+            # the packed CUDA extend kernel only when even one chunk does not
+            # fit the live VRAM.
+            ct = self._extend_chunk_rows(kv_heads, head_dim)
+            if ct >= 4096:
+                if self._decode_scratch is None or self._decode_max_ctx < ct:
+                    self._decode_scratch = (
+                        torch.empty(ct, kv_heads, head_dim,
+                                    dtype=torch.bfloat16, device=self.device),
+                        torch.empty(ct, kv_heads, head_dim,
+                                    dtype=torch.bfloat16, device=self.device),
+                    )
+                    self._decode_max_ctx = ct
+                if self._decode_indices is None or self._decode_indices.numel() < ct:
+                    self._decode_indices = torch.arange(
+                        ct, dtype=torch.int32, device=self.device)
+                if self._extend_lse is None:
+                    self._extend_lse = torch.empty(
+                        n, nq, dtype=torch.float32, device=self.device)
+                out = torch.empty_like(q)
+                iso_extend_chunked(
+                    q, out, k_flat, v_flat, metadata.cu_seqlens_q_gpu,
+                    metadata.kv_indptr, metadata.prefix_indices,
+                    k.reshape(n, kv_heads, head_dim),
+                    v.reshape(n, kv_heads, head_dim),
+                    metadata.max_q_len, scale, self.iso_fmt,
+                    self._decode_scratch, self._decode_indices,
+                    self._extend_lse, ct,
+                )
+            else:
+                out = torch.empty_like(q)
+                iso_attention_extend(
+                    q.reshape(n, -1), out.reshape(n, -1), k_flat, v_flat,
+                    k.reshape(n, -1), v.reshape(n, -1),
+                    metadata.cu_seqlens_q_gpu, metadata.prefix_indptr,
+                    metadata.prefix_indices,
+                    nq, kv_heads, head_dim, scale, metadata.max_q_len,
+                    self.iso_fmt,
+                )
         self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
         return out
 
