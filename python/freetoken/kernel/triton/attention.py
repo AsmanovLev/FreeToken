@@ -34,7 +34,11 @@ def _select_extend_tile(head_dim: int, block_d: int, smem_optin: int) -> tuple[i
         return (block_m + 2 * block_n) * block_d * 2 <= budget
 
     if head_dim <= 128:
-        return 128, 64
+        # (128, 64) compiles to ~128 KB of shared memory on this triton version,
+        # over the ~99 KB opt-in of consumer GPUs (sm_86/89); the compiled
+        # footprint is not captured by the formula below, so gate it on the
+        # device's opt-in directly. A100/H100 (>= 163 KB) keep the fast tile.
+        return (128, 64) if smem_optin >= 131072 else (64, 32)
     if head_dim <= 256:
         return (128, 64) if fits(128, 64) else (64, 32)
     if head_dim <= 384:
@@ -486,6 +490,9 @@ def _extend_attention_kernel(
     stride_vh,
     stride_ot,
     stride_oh,
+    lse_ptr,
+    stride_lt,
+    WRITE_LSE: tl.constexpr,
     GROUP: tl.constexpr,
     D: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -575,6 +582,13 @@ def _extend_attention_kernel(
             m_i = m_new
 
     out = tl.where(l_i[:, None] == 0.0, 0.0, acc / l_i[:, None])
+    if WRITE_LSE:
+        lse = tl.where(l_i > 0.0, m_i + tl.log(l_i), -float("inf"))
+        tl.store(
+            lse_ptr + (q_start + offs_m) * stride_lt + q_head,
+            lse,
+            mask=mask_m,
+        )
     tl.store(
         o_ptr
         + (q_start + offs_m[:, None]) * stride_ot
@@ -611,6 +625,9 @@ def _extend_attention_split_kernel(
     stride_vch,
     stride_ot,
     stride_oh,
+    lse_ptr,
+    stride_lt,
+    WRITE_LSE: tl.constexpr,
     GROUP: tl.constexpr,
     D: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -756,6 +773,15 @@ def _extend_attention_split_kernel(
         out.to(o_ptr.dtype.element_ty),
         mask=mask_m[:, None] & mask_dv[None, :],
     )
+    if WRITE_LSE:
+        # per-(q_token, q_head) logsumexp of this partial's softmax (m + log l).
+        # Empty rows (l == 0) get -inf so an LSE merge weights them 0.
+        lse = tl.where(l_i > 0.0, m_i + tl.log(l_i), -float("inf"))
+        tl.store(
+            lse_ptr + (q_start + offs_m) * stride_lt + q_head,
+            lse,
+            mask=mask_m,
+        )
 
 
 def extend_paged_attention(
@@ -773,8 +799,14 @@ def extend_paged_attention(
     out: torch.Tensor | None = None,
     k_extend: torch.Tensor | None = None,
     v_extend: torch.Tensor | None = None,
+    lse_out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Block-tiled causal prefill/extend attention over paged KV cache."""
+    """Block-tiled causal prefill/extend attention over paged KV cache.
+
+    ``lse_out`` ([total_q, num_q_heads] fp32, optional): when given, each kernel
+    also writes the per-row logsumexp of the computed softmax (m + log l; -inf
+    for empty rows). Callers merge chunked partials by LSE. Sinks fold into the
+    LSE seed, so merged partials are only exact for sink-free attention."""
 
     assert q.is_cuda and k_cache.is_cuda and v_cache.is_cuda
     assert q.dim() == 3 and k_cache.dim() == 3 and v_cache.dim() == 3
@@ -792,6 +824,14 @@ def extend_paged_attention(
         sinks = sinks.contiguous()
 
     o = out if out is not None else torch.empty_like(q)
+    write_lse = lse_out is not None
+    if write_lse:
+        assert lse_out.dim() == 2 and lse_out.shape[0] >= num_q_tokens
+        lse_out = lse_out.contiguous()
+        lse_stride = lse_out.stride(0)
+    else:
+        lse_out = q.new_empty((1, 1), dtype=torch.float32)
+        lse_stride = 1
     sinks_arg = sinks if sinks is not None else q
     block_d = triton.next_power_of_2(head_dim)
     block_dv = triton.next_power_of_2(head_dim)
@@ -834,6 +874,9 @@ def extend_paged_attention(
             v_cache.stride(1),
             o.stride(0),
             o.stride(1),
+            lse_out,
+            lse_stride,
+            WRITE_LSE=write_lse,
             GROUP=num_q_heads // num_kv_heads,
             D=head_dim,
             BLOCK_D=block_d,
@@ -866,6 +909,9 @@ def extend_paged_attention(
         v_cache.stride(1),
         o.stride(0),
         o.stride(1),
+        lse_out,
+        lse_stride,
+        WRITE_LSE=write_lse,
         GROUP=num_q_heads // num_kv_heads,
         D=head_dim,
         BLOCK_D=block_d,
