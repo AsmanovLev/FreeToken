@@ -244,19 +244,50 @@ class IsoAttentionBackend(BaseAttnBackend):
             if self.capture is None and n == 1:
                 total = int(metadata.indptr[-1])
                 if total > 0:
-                    ct = self._scratch_tokens(kv_heads, head_dim)
                     free_bytes, _ = torch.cuda.mem_get_info(self.device)
-                    scratch_bytes = ct * kv_heads * head_dim * 2 * 2
-                    if ct >= total and free_bytes > 2 * scratch_bytes + 64 * 2**20:
-                        return self._decode_small_context(
-                            q, k_flat, v_flat, metadata, kv_heads, head_dim,
-                            scale, n, nq, total)
-                    if free_bytes > 2 * scratch_bytes + 64 * 2**20:
-                        # context larger than the scratch budget: serve it in
-                        # scratch-sized chunks and merge partials by LSE (same
-                        # math as the triton kernel's own split-k combine) --
-                        # full-speed decode at ANY context length
-                        if self._decode_scratch is None or self._decode_max_ctx < ct:
+                    # driver free alone lies after a big prefill: the caching
+                    # allocator holds the transient blocks as reserved-unused
+                    # (same lesson as moe's _prefill_block_size)
+                    cached = torch.cuda.memory_reserved(self.device) - \
+                        torch.cuda.memory_allocated(self.device)
+                    free_bytes += max(0, cached)
+                    per_token = kv_heads * head_dim * 2 * 2
+                    if self._decode_scratch is not None:
+                        # resident scratch is already paid for: reuse its full
+                        # size, no VRAM-dependent shrink
+                        ct = max(1, min(self._decode_max_ctx, total))
+                        if free_bytes > 16 * 2**20:
+                            if ct >= total:
+                                return self._decode_small_context(
+                                    q, k_flat, v_flat, metadata, kv_heads,
+                                    head_dim, scale, n, nq, total)
+                            out = torch.empty_like(q)
+                            chunked_decode(
+                                q, out, k_flat, v_flat, metadata.indptr,
+                                metadata.indices, nq, kv_heads, head_dim,
+                                scale, metadata.q_positions,
+                                self._decode_scratch, ct, self.iso_fmt,
+                            )
+                            return out
+                    else:
+                        # first allocation: size the scratch from live VRAM
+                        # (free - 48 MB, halved as growth headroom). A floor of
+                        # 4096 rows keeps the chunk count (and the [n, heads,
+                        # chunks, D] partial buffers) sane; below that the
+                        # packed kernel runs (correct, slower).
+                        ct_env = self._scratch_tokens(kv_heads, head_dim)
+                        ct_live = (free_bytes - 48 * 2**20) // 2 // per_token
+                        ct = min(ct_env, ct_live, total)
+                        if ct < 4096:
+                            out = torch.empty_like(q)
+                            iso_attention_decode(
+                                q.reshape(n, -1), out.reshape(n, -1), k_flat,
+                                v_flat, metadata.indptr, metadata.indices,
+                                nq, kv_heads, head_dim, scale, self.iso_fmt,
+                            )
+                            return out
+                        scratch_bytes = ct * per_token
+                        if free_bytes > scratch_bytes + 48 * 2**20:
                             self._decode_scratch = (
                                 torch.empty(ct, kv_heads, head_dim,
                                             dtype=torch.bfloat16, device=self.device),
@@ -264,14 +295,18 @@ class IsoAttentionBackend(BaseAttnBackend):
                                             dtype=torch.bfloat16, device=self.device),
                             )
                             self._decode_max_ctx = ct
-                        out = torch.empty_like(q)
-                        chunked_decode(
-                            q, out, k_flat, v_flat, metadata.indptr,
-                            metadata.indices, nq, kv_heads, head_dim, scale,
-                            metadata.q_positions, self._decode_scratch, ct,
-                            self.iso_fmt,
-                        )
-                        return out
+                            if ct >= total:
+                                return self._decode_small_context(
+                                    q, k_flat, v_flat, metadata, kv_heads,
+                                    head_dim, scale, n, nq, total)
+                            out = torch.empty_like(q)
+                            chunked_decode(
+                                q, out, k_flat, v_flat, metadata.indptr,
+                                metadata.indices, nq, kv_heads, head_dim,
+                                scale, metadata.q_positions,
+                                self._decode_scratch, ct, self.iso_fmt,
+                            )
+                            return out
             out = torch.empty_like(q)
             iso_attention_decode(
                 q.reshape(n, -1), out.reshape(n, -1), k_flat, v_flat,
