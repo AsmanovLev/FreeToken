@@ -45,6 +45,22 @@ _NVFP4_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
     layer_to_bank=lambda layer, config: layer,  # every layer is MoE
     desc="Qwen3.5 NVFP4 experts",
 )
+# llm-compressor (compressed-tensors) export (Nex-N2.5-mini-NVFP4): per-expert
+# ``weight_packed`` | ``weight_scale`` | ``weight_global_scale`` (quant-side global -> its
+# reciprocal at ingest). ``input_global_scale`` (the W4A4 activation scale) deliberately does
+# not match: the routed-expert paths run W4A16 and never quantize activations.
+_NVFP4_CT_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
+    key_pattern=re.compile(
+        r"^model\.language_model\.layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\."
+        r"(?P<proj>gate_proj|up_proj|down_proj)\."
+        r"(?P<kind>weight_packed|weight_global_scale|weight_scale)$"
+    ),
+    proj_to_role={"gate_proj": "gate", "up_proj": "up", "down_proj": "down"},
+    layer_to_bank=lambda layer, config: layer,  # every layer is MoE
+    desc="Qwen3.5 NVFP4 experts (compressed-tensors)",
+    kind_map={"weight_packed": "weight", "weight_global_scale": "weight_scale_2"},
+    global_reciprocal=True,
+)
 # Suffixes of the per-tensor modelopt quant scales; consumed alongside their ``.weight``,
 # never yielded on their own.
 _SCALE_SUFFIXES = (".weight_scale", ".weight_scale_2", ".input_scale")
@@ -618,10 +634,25 @@ def _iter_weights_compressed_tensors(
     tp_info = get_tp_info()
     nvfp4_buf: dict[str, dict[int, tuple]] = {}
     bf16_buf: dict[str, dict[int, torch.Tensor]] = {}
+    shared_buf: dict[str, dict[str, torch.Tensor]] = {}
 
     def _emit_bf16_weight(name: str, tensor: torch.Tensor):
-        """Plain bf16 ``.weight``: GDN in_proj fusion, Gemma (1+w) norms, else passthrough."""
+        """Plain bf16 ``.weight``: shared-expert gate/up merge, self_attn qkv fusion,
+        GDN in_proj fusion, Gemma (1+w) norms, else passthrough."""
         base = name[: -len(".weight")]
+        if name.endswith(_SHARED_GATE) or name.endswith(_SHARED_UP):
+            prefix = name.rsplit(".mlp.shared_expert.", 1)[0]
+            slots = shared_buf.setdefault(prefix, {})
+            slots["gate" if name.endswith(_SHARED_GATE) else "up"] = tensor
+            if "gate" in slots and "up" in slots:
+                merged = torch.cat([slots["gate"], slots["up"]], dim=0)
+                del shared_buf[prefix]
+                yield f"{prefix}.mlp.shared_expert.gate_up_proj.weight", merged
+            return
+        emit = _ct_bf16_fuse(base, tensor, bf16_buf, _CT_NVFP4_FUSE)
+        if emit is not None:
+            yield from emit
+            return
         emit = _ct_bf16_fuse(base, tensor, bf16_buf, _CT_BF16_FUSE)
         if emit is not None:
             yield from emit
@@ -643,6 +674,8 @@ def _iter_weights_compressed_tensors(
             for raw_name in reader.names_in(file):
                 if raw_name.startswith(_SKIP_PREFIXES):
                     continue
+                if _NVFP4_EXPERT_RE.search(raw_name):
+                    continue  # routed NVFP4 experts -> offload cache (expert banks)
                 if raw_name.endswith(_CT_SCALE_SUFFIXES):
                     continue  # consumed with weight_packed (or unused W4A4 activation scales)
 
@@ -691,6 +724,7 @@ def _iter_weights_compressed_tensors(
 
     assert not nvfp4_buf, f"Incomplete NVFP4 fusions: {list(nvfp4_buf.keys())}"
     assert not bf16_buf, f"Incomplete bf16 fusions: {list(bf16_buf.keys())}"
+    assert not shared_buf, f"Incomplete shared-expert merges: {list(shared_buf.keys())}"
 
 
 def iter_weights_parallel(
@@ -1109,8 +1143,17 @@ def iter_expert_pieces(model_path, config, kind: QuantKind, *, parallel: bool | 
     return per_expert_pieces(_serial(), locate, tensors_per_expert=6)
 
 
+def _select_expert_source_spec(model_path: str) -> Nvfp4ExpertSourceSpec:
+    """ModelOpt (``weight``/``weight_scale``/``weight_scale_2``) or llm-compressor
+    (``weight_packed``/``weight_global_scale``) NVFP4 expert layout, by quant_method."""
+    quant = getattr(cached_load_hf_config(model_path), "quantization_config", None) or {}
+    get = quant.get if isinstance(quant, dict) else (lambda k, d=None: getattr(quant, k, d))
+    method = str(get("quant_method") or "").lower()
+    return _NVFP4_CT_SOURCE_SPEC if method == "compressed-tensors" else _NVFP4_SOURCE_SPEC
+
+
 def nvfp4_expert_spec(model_path: str, config):
-    return _NVFP4_SOURCE_SPEC
+    return _select_expert_source_spec(model_path)
 
 
 __all__ = [

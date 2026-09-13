@@ -493,7 +493,7 @@ class IsoAttentionBackend(BaseAttnBackend):
                 out = torch.empty_like(q)
                 iso_extend_chunked(
                     q, out, k_flat, v_flat, metadata.cu_seqlens_q_gpu,
-                    metadata.kv_indptr, metadata.prefix_indices,
+                    metadata.indptr, metadata.prefix_indices,
                     k.reshape(n, kv_heads, head_dim),
                     v.reshape(n, kv_heads, head_dim),
                     metadata.max_q_len, scale, self.iso_fmt,

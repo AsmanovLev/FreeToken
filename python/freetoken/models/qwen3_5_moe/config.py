@@ -128,6 +128,43 @@ def _attn_quant(hf_config: Any) -> str:
     return "none"
 
 
+def _ct_targets_and_ignore(hf_config: Any) -> tuple[list[str], list[str]]:
+    """A compressed-tensors config's ``config_groups`` targets + ``ignore`` list, flattened
+    to strings (the modelopt ``quantized_layers`` map is irrelevant here)."""
+    get = _quant_accessor(hf_config)
+    if get is None:
+        return [], []
+    targets = [
+        str(t)
+        for g in (get("config_groups") or {}).values() or []
+        for t in ((g or {}).get("targets") or [])
+    ]
+    return targets, [str(i) for i in (get("ignore") or [])]
+
+
+def _ct_covers(hf_config: Any, probe: str) -> bool:
+    """Whether a compressed-tensors config's ``targets`` quantize the module class matched by
+    ``probe`` (a literal substring of the module path, e.g. ``"mlp.experts."``).
+
+    llm-compressor targets name modules by fnmatch glob or ``re:`` regex; a bare ``"Linear"``
+    target covers every Linear module except those in the ``ignore`` list. The ignore list is
+    consulted only for the generic target -- a specific target (e.g. the Nex-N2.5 experts-only
+    regex) is authoritative on its own."""
+    targets, ignore = _ct_targets_and_ignore(hf_config)
+    import re as _re
+    for t in targets:
+        pattern = t[3:] if t.startswith("re:") else t
+        sample = f"model.language_model.layers.0.{probe}0.gate_proj"
+        try:
+            if _re.search(pattern, sample):
+                return True
+        except _re.error:
+            pass
+    if not any(str(t).strip().lower() == "linear" for t in targets):
+        return False
+    return not any(probe in i for i in ignore)
+
+
 def _layer_types(text: Any) -> list[str]:
     layer_types = getattr(text, "layer_types", None)
     if layer_types is not None:
@@ -184,12 +221,24 @@ def parse_config(hf_config: Any) -> ModelConfig:
     dense_quant = "nvfp4" if expert_quant == "nvfp4" else _dense_mlp_quant(hf_config)
     lm_head_quant = _lm_head_quant(hf_config)
 
-    # compressed-tensors NVFP4 (dense Qwen3.6-27B): the attention (q/k/v/o, GDN out_proj) AND
-    # the dense MLP are W4A16 NVFP4; GDN in_proj_*, lm_head, norms stay bf16. Wire the shared
-    # W4A16 kernels (attn_quant=="nvfp4" routes the attention/GDN linears through them too).
+    # compressed-tensors NVFP4 (llm-compressor). What the config_groups actually quantize is
+    # per-checkpoint, read off the targets instead of assuming: Nex-N2.5-mini targets ONLY the
+    # routed experts (attention, GDN, shared_expert, lm_head all sit in the ignore list) ->
+    # experts NVFP4, dense stays bf16. Dense Qwen3.6-27B / Muse-Glimmer use generic "Linear"
+    # targets -> attention + dense MLP W4A16 (GDN in_proj_*, lm_head, norms bf16).
     if _compressed_tensors_nvfp4(hf_config):
-        attn_quant = "nvfp4"
-        dense_quant = "nvfp4"
+        expert_quant = "nvfp4" if _ct_covers(hf_config, "mlp.experts.") else "none"
+        attn_quant = (
+            "nvfp4"
+            if _ct_covers(hf_config, "self_attn.") or _ct_covers(hf_config, "linear_attn.")
+            else "none"
+        )
+        dense_quant = (
+            "nvfp4"
+            if _ct_covers(hf_config, "shared_expert.")
+            or _ct_covers(hf_config, ".mlp.gate_proj")
+            else "none"
+        )
         lm_head_quant = "none"
 
     # Dense variants (e.g. Qwen3.6-27B) report num_experts==0: route the decoder MLP through
