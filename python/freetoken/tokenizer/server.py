@@ -19,6 +19,7 @@ from freetoken.message import (
     CacheRebuildResultMsg,
     DetokenizeMsg,
     ErrorReplyMsg,
+    PrefillProgressMsg,
     PromptAdmittedMsg,
     TokenizeMsg,
     UserMsg,
@@ -53,6 +54,19 @@ def _prompt_admitted_reply(msg: PromptAdmittedMsg) -> UserReply:
 def _error_reply(msg: ErrorReplyMsg) -> UserReply:
     return UserReply(
         uid=msg.uid, incremental_output="", finished=True, error=msg.error, error_code=msg.code,
+    )
+
+
+def _prefill_progress_reply(msg: PrefillProgressMsg) -> UserReply:
+    """Translate the scheduler's chunked-prefill progress onto the frontend path."""
+    return UserReply(
+        uid=msg.uid,
+        incremental_output="",
+        finished=False,
+        prompt_tokens_delta=0,
+        prefill_processed=msg.processed,
+        prefill_total=msg.total,
+        prefill_cached=msg.cached,
     )
 
 
@@ -167,6 +181,7 @@ def tokenize_worker(
             tokenize_msg = [m for m in pending_msg if isinstance(m, TokenizeMsg)]
             abort_msg = [m for m in pending_msg if isinstance(m, AbortMsg)]
             prompt_admitted_msg = [m for m in pending_msg if isinstance(m, PromptAdmittedMsg)]
+            prefill_progress_msg = [m for m in pending_msg if isinstance(m, PrefillProgressMsg)]
             error_reply_msg = [m for m in pending_msg if isinstance(m, ErrorReplyMsg)]
             # Cache-rebuild control messages are pure passthrough (no tokenization):
             # CacheRebuildMsg (api -> scheduler) and CacheRebuildResultMsg (scheduler -> api).
@@ -197,7 +212,7 @@ def tokenize_worker(
             n_control = sum(
                 isinstance(
                     m,
-                    (CacheRebuildMsg, CacheRebuildResultMsg, ErrorReplyMsg, PromptAdmittedMsg),
+                    (CacheRebuildMsg, CacheRebuildResultMsg, ErrorReplyMsg, PromptAdmittedMsg, PrefillProgressMsg),
                 )
                 for m in pending_msg
             )
@@ -236,7 +251,8 @@ def tokenize_worker(
 
             _send_generation_replies(
                 send_frontend,
-                [_prompt_admitted_reply(msg) for msg in prompt_admitted_msg],
+                [_prompt_admitted_reply(msg) for msg in prompt_admitted_msg]
+                + [_prefill_progress_reply(msg) for msg in prefill_progress_msg],
                 sampled_replies,
                 [_error_reply(msg) for msg in error_reply_msg],
             )

@@ -103,6 +103,21 @@ class CacheRebuildResultMsg(BaseTokenizerMsg):
 
 
 @dataclass
+class PrefillProgressMsg(BaseTokenizerMsg):
+    """Scheduler -> tokenizer accounting signal for chunked prefill progress.
+
+    Emitted after each intermediate chunk completes (not the final chunk, which
+    triggers the normal DetokenizeMsg path). The frontend uses this to show
+    incremental prefill progress like "2048/4096 tokens".
+    """
+
+    uid: int
+    processed: int  # tokens prefilled so far (cached + newly computed)
+    total: int      # total prompt length
+    cached: int = 0 # prefix-cache hit
+
+
+@dataclass
 class ErrorReplyMsg(BaseTokenizerMsg):
     # scheduler -> tokenizer/detokenizer worker -> frontend: a request the scheduler cannot
     # serve (e.g. its prompt exceeds the KV budget). The worker translates it into a terminal

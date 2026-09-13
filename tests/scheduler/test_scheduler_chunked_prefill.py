@@ -150,3 +150,83 @@ def test_batched_prefill_carries_each_new_prompt_admission():
     batch = pm.schedule_next_batch(16)
     assert batch is not None
     assert batch.prompt_admissions == [(1, 3, 0), (2, 5, 0)]
+
+
+def test_short_prompt_emits_no_prefill_progress():
+    """A prompt that fits in one prefill batch must NOT publish a progress entry -- the
+    final chunk leaves prefill_progress_emits empty so completion flows through the
+    usual DetokenizeMsg path."""
+    from freetoken.core import SamplingParams
+    from freetoken.scheduler.utils import PendingReq
+
+    _cm, _tm, _dm, pm = _build_managers(num_pages=64)
+    pm.pending_list = [
+        PendingReq(
+            uid=UID,
+            input_ids=torch.arange(CHUNK, dtype=torch.int32),
+            sampling_params=SamplingParams(max_tokens=4),
+        )
+    ]
+    batch = pm.schedule_next_batch(CHUNK * 2)
+    assert batch is not None
+    assert batch.prefill_progress_emits == []
+
+
+def test_chunked_prefill_emits_progress_per_intermediate_chunk():
+    """A 3-chunk prefill (24 tokens / CHUNK=8 budget) must emit progress for chunks 1 and 2
+    and nothing for the final chunk (chunk 3) -- 2 progress entries total, monotonically
+    advancing `processed` toward `total`."""
+    from freetoken.core import SamplingParams
+    from freetoken.scheduler.prefill import ChunkedReq
+    from freetoken.scheduler.utils import PendingReq
+
+    cm, _tm, _dm, pm = _build_managers(num_pages=64)
+    prompt_len = 3 * CHUNK
+    pm.pending_list = [
+        PendingReq(
+            uid=UID,
+            input_ids=torch.arange(prompt_len, dtype=torch.int32),
+            sampling_params=SamplingParams(max_tokens=4),
+        )
+    ]
+
+    progress: List[List[Tuple[int, int, int, int]]] = []
+    while pm.runnable:
+        batch = pm.schedule_next_batch(CHUNK)
+        assert batch is not None
+        progress.append(list(batch.prefill_progress_emits))
+        cm.allocate_paged(batch.reqs)
+        for req in batch.reqs:
+            req.complete_one()
+
+    # chunk 1: ChunkedReq, processed = 0 + 8, total = 24, cached = 0
+    assert progress[0] == [(UID, CHUNK, prompt_len, 0)]
+    # chunk 2: continuation, processed = 8 + 8, total = 24, cached = 0
+    assert progress[1] == [(UID, 2 * CHUNK, prompt_len, 0)]
+    # chunk 3: final non-chunked, no progress emit
+    assert progress[2] == []
+
+
+def test_chunked_prefill_progress_carries_prefix_cache_hit():
+    """The first chunk's emitted `cached` field must reflect the prefix-cache hit so the
+    frontend can show "2048 cached / 4096 total"."""
+    from freetoken.core import SamplingParams
+    from freetoken.scheduler.utils import PendingReq
+
+    cm, _tm, _dm, pm = _build_managers(num_pages=64)
+    _drive_chunked_prefill(cm, _tm, pm, n_chunks=4)  # seed: 32-token prompt now in cache
+
+    cached_len = 4 * CHUNK
+    prompt_len = cached_len + 2 * CHUNK  # first chunk fits cached+1; second chunk is the rest
+    pm.pending_list = [
+        PendingReq(
+            uid=UID + 1,
+            input_ids=torch.arange(prompt_len, dtype=torch.int32),
+            sampling_params=SamplingParams(max_tokens=4),
+        )
+    ]
+    # budget = 2*CHUNK fits the full prompt -> single non-chunked batch, no progress emit
+    batch = pm.schedule_next_batch(2 * CHUNK)
+    assert batch is not None
+    assert batch.prefill_progress_emits == []
+    assert batch.prompt_admissions == [(UID + 1, prompt_len, cached_len)]

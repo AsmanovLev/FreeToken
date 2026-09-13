@@ -266,6 +266,7 @@ class PrefillManager:
         reqs: List[Req] = []
         chunked_list: List[PendingReq] = []
         prompt_admissions: List[Tuple[int, int, int]] = []
+        prefill_progress_emits: List[Tuple[int, int, int, int]] = []
         # Snapshot here, before the forward's complete_one() advances cached_len: the tokens
         # forwarded this batch (extend_len) and the prefix-cache hit. SGLang counts the hit
         # once at admission, so continuation chunks (already-chunked reqs) contribute 0.
@@ -278,6 +279,19 @@ class PrefillManager:
                 if isinstance(req, ChunkedReq):
                     pending_req.chunked_req = req
                     chunked_list.append(pending_req)
+                    # More chunks are coming after this batch: publish a progress signal so
+                    # the frontend can show "processed/total" while prefill is still running.
+                    # `cached_len`/`extend_len` are pre-forward snapshots (the forward's
+                    # complete_one advances cached_len); `cache_handle.cached_len` is the
+                    # original prefix-cache hit and is constant across continuation chunks.
+                    prefill_progress_emits.append(
+                        (
+                            req.uid,
+                            req.cached_len + req.extend_len,
+                            pending_req.input_len,
+                            req.cache_handle.cached_len,
+                        )
+                    )
                 reqs.append(req)
                 if not is_continuation:
                     # Record the COMPLETE prompt length and the prefix-cache hit on the
@@ -298,6 +312,7 @@ class PrefillManager:
         batch.log_new_tokens = log_new_tokens
         batch.log_cached_tokens = log_cached_tokens
         batch.prompt_admissions = prompt_admissions
+        batch.prefill_progress_emits = prefill_progress_emits
         return batch
 
     def abort_req(self, uid: int) -> Req | None:

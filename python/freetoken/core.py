@@ -145,6 +145,12 @@ class Batch:
     # _prepare_batch succeeds. Continuation chunks leave this empty, so accounting is
     # exactly-once.
     prompt_admissions: List[Tuple[int, int, int]] = field(default_factory=list, init=False)
+    # (uid, processed, total, cached) for chunked-prefill requests that will need MORE
+    # chunks after this batch. The scheduler turns these into PrefillProgressMsg only AFTER
+    # _prepare_batch succeeds, so a batch that fails preparation never publishes a stale
+    # "x/y" value. The final chunk (chunk_size == remain_len) leaves this empty -- the
+    # usual DetokenizeMsg path carries completion, and progress of total/total is implied.
+    prefill_progress_emits: List[Tuple[int, int, int, int]] = field(default_factory=list, init=False)
 
     @property
     def is_prefill(self) -> bool:

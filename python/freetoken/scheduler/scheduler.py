@@ -16,6 +16,7 @@ from freetoken.message import (
     DetokenizeMsg,
     ErrorReplyMsg,
     ExitMsg,
+    PrefillProgressMsg,
     PromptAdmittedMsg,
     UserMsg,
 )
@@ -843,6 +844,7 @@ class Scheduler(SchedulerIOMixin):
             return None
         forward_input = self._prepare_batch(batch)
         self._report_prompt_admissions(batch)
+        self._report_prefill_progress(batch)
         return forward_input
 
     def _report_prompt_admissions(self, batch: Batch) -> None:
@@ -857,6 +859,26 @@ class Scheduler(SchedulerIOMixin):
             [
                 PromptAdmittedMsg(uid=uid, prompt_tokens=prompt_tokens, cached_tokens=cached_tokens)
                 for uid, prompt_tokens, cached_tokens in batch.prompt_admissions
+            ]
+        )
+
+    def _report_prefill_progress(self, batch: Batch) -> None:
+        """Publish per-chunk prefill progress for chunked-prefill requests.
+
+        Mirrors ``_report_prompt_admissions``: fires only after batch preparation
+        succeeded, and only for batches that emitted at least one progress entry
+        (i.e. a chunked-prefill request that still has more chunks coming). The
+        final chunk of a request leaves ``batch.prefill_progress_emits`` empty --
+        completion flows through the usual DetokenizeMsg path.
+        """
+        if not batch.is_prefill or not batch.prefill_progress_emits:
+            return
+        self.send_result(
+            [
+                PrefillProgressMsg(
+                    uid=uid, processed=processed, total=total, cached=cached
+                )
+                for uid, processed, total, cached in batch.prefill_progress_emits
             ]
         )
 

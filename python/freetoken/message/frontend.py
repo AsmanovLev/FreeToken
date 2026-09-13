@@ -32,6 +32,10 @@ class UserReply(BaseFrontendMsg):
     # Prefix-cache hit length (tokens of the prompt served from cache instead of
     # recomputed). Arrives once, on the same reply as prompt_tokens_delta.
     cached_tokens: int = 0
+    # Chunked prefill progress (non-zero only on intermediate-chunk progress updates).
+    prefill_processed: int = 0  # tokens prefilled so far
+    prefill_total: int = 0      # total prompt length
+    prefill_cached: int = 0     # prefix-cache hit
     # KV page-pool usage snapshot (not-evictable used/total) for the shell status bar.
     # 0/0 when not reported (e.g. the prompt-tokens reply, or owned-KV models with no
     # shared page pool).

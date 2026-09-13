@@ -174,6 +174,9 @@ class FrontendManager:
     # "num_mamba_slots"}, from the same ack. Seeds geometry before the first generation reply
     # (the running snapshot channel) has anything. None until meta arrives.
     cache_pools: Dict[str, int] | None = None
+    # Per-request prefill progress: uid -> {total, processed, cached, phase}
+    # Updated by PrefillProgressMsg from the scheduler; cleaned up 5s after completion.
+    prefill_progress: Dict[int, Dict[str, int | str]] = field(default_factory=dict)
     # one {index, name, uuid, total_bytes} per TP rank, from the same ack; /v1/stats gpus
     gpus: List[Dict[str, Any]] = field(default_factory=list)
     # Backend worker Process handles (TP schedulers + tokenizer/detokenizer), captured from the
@@ -251,10 +254,33 @@ class FrontendManager:
                 # client disconnects and abort_user removes its ack queue. Delivery to a live
                 # request remains gated below, but observation must happen first.
                 self.stats.observe(msg)
+                # Track chunked prefill progress
+                if isinstance(msg, UserReply) and msg.prefill_processed > 0:
+                    self.prefill_progress[msg.uid] = {
+                        "total": msg.prefill_total,
+                        "processed": msg.prefill_processed,
+                        "cached": msg.prefill_cached,
+                        "phase": "prefilling",
+                    }
+                elif isinstance(msg, UserReply) and msg.prompt_tokens_delta > 0:
+                    # Admission: record total prompt length
+                    self.prefill_progress[msg.uid] = {
+                        "total": msg.prompt_tokens_delta,
+                        "processed": msg.cached_tokens,
+                        "cached": msg.cached_tokens,
+                        "phase": "prefilling",
+                    }
                 if msg.uid not in self.ack_map:
                     continue
                 self.ack_map[msg.uid].append(msg)
                 self.event_map[msg.uid].set()
+                # Schedule cleanup of prefill progress after completion
+                if isinstance(msg, UserReply) and msg.finished and msg.uid in self.prefill_progress:
+                    uid = msg.uid
+                    async def _cleanup(uid=uid):
+                        await asyncio.sleep(5)
+                        self.prefill_progress.pop(uid, None)
+                    asyncio.create_task(_cleanup())
 
     def _resolve_rebuild(self, msg: CacheRebuildReply) -> None:
         """Terminal transition for a rebuild: rebuilding -> serving | failed. This is the ONLY

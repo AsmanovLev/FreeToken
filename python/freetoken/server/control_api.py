@@ -78,3 +78,11 @@ def register_control_routes(
         if get_model_sampling is not None:
             doc["model"]["sampling"] = get_model_sampling() or {}
         return doc
+
+    @app.get("/v1/progress")
+    async def progress():
+        state = get_state()
+        return {
+            str(uid): data
+            for uid, data in state.prefill_progress.items()
+        }
