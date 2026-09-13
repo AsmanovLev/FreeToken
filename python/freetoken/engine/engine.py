@@ -503,6 +503,16 @@ class Engine:
         model_state = self.model.state_dict()
         if config.use_dummy_weight:
             return _make_dummy_weight_state_dict(model_state, device=self.device)
+        # qwen3_5_moe MLLM checkpoints carry auxiliary modules (vision tower, MTP head, carry
+        # buffer) that are dropped at load; apply the engine's --skip-* flags first.
+        try:
+            from freetoken.models.qwen3_5_moe.weight import configure_skip_modules
+        except ImportError:
+            pass
+        else:
+            configure_skip_modules(
+                vision=config.skip_vision, mtp=config.skip_mtp, carry=config.skip_carry
+            )
         # _materialize casts each loaded tensor to its model-param dtype (model_state), so
         # models declaring per-tensor dtypes (e.g. DSV4's mixed fp8/fp32/bf16) are preserved;
         # offload models exclude experts (served from the offload cache, not dense weights).

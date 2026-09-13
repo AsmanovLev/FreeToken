@@ -133,9 +133,35 @@ def _load_maybe_quantized(f, raw_name: str, keyset: set[str]) -> torch.Tensor:
     return tensor
 
 
+# Auxiliary modules dropped at load unless un-skipped via the engine's --skip-{vision,mtp,
+# carry} flags (configure_skip_modules rebuilds this tuple). Defaults match text-only
+# serving: vision tower + MTP speculative head always dropped, and the MLLM carry buffer
+# (model.carry.*, a large bf16 blob) dropped so MLLM checkpoints fit small GPUs.
+_SKIP_PREFIXES: tuple[str, ...] = ("mtp.", "model.visual.", "visual.", "model.carry.")
+
+# Prefix groups per --skip-* flag; a False flag leaves its group out of _SKIP_PREFIXES.
+_SKIP_GROUPS: dict[str, tuple[str, ...]] = {
+    "vision": ("model.visual.", "visual."),
+    "mtp": ("mtp.",),
+    "carry": ("model.carry.",),
+}
+
+
+def configure_skip_modules(*, vision: bool, mtp: bool, carry: bool) -> None:
+    """Rebuild ``_SKIP_PREFIXES`` from the engine's skip flags. Idempotent; call before
+    ``iter_weights``/``load_weight``. A True flag drops its prefixes from the dense pass,
+    False keeps them (the module loads)."""
+    prefixes: list[str] = []
+    for flag, enabled in (("vision", vision), ("mtp", mtp), ("carry", carry)):
+        if enabled:
+            prefixes.extend(_SKIP_GROUPS[flag])
+    global _SKIP_PREFIXES
+    _SKIP_PREFIXES = tuple(prefixes)
+
+
 def _rename(raw_name: str) -> str | None:
     """HF key -> FreeToken state-dict key, or None to skip."""
-    if raw_name.startswith(("mtp.", "model.visual.", "visual.")):
+    if raw_name.startswith(_SKIP_PREFIXES):
         return None
     # ModelOpt FP8 KV-cache static scales (full-attention layers only). FreeToken keeps the
     # KV cache in the engine's native precision (>= the checkpoint's quantized KV), so these
@@ -615,7 +641,7 @@ def _iter_weights_compressed_tensors(
             disable=not tp_info.is_primary(),
         ):
             for raw_name in reader.names_in(file):
-                if raw_name.startswith(("mtp.", "model.visual.", "visual.")):
+                if raw_name.startswith(_SKIP_PREFIXES):
                     continue
                 if raw_name.endswith(_CT_SCALE_SUFFIXES):
                     continue  # consumed with weight_packed (or unused W4A4 activation scales)

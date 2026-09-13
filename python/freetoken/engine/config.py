@@ -100,6 +100,13 @@ class EngineConfig:
     swa_num_pages_override: int | None = None
     distributed_timeout: float = 60.0
     use_dummy_weight: bool = False
+    # Auxiliary-module skips for MLLM checkpoints (qwen3_5_moe): the vision tower
+    # (model.visual.* / visual.*) and the MTP speculative head (mtp.*) are served
+    # text-only, and the carry buffer (model.carry.*) is a large bf16 blob that
+    # otherwise blocks small-GPU text loads. False loads the module.
+    skip_vision: bool = True
+    skip_mtp: bool = True
+    skip_carry: bool = True
     use_pynccl: bool = True
     max_seq_len_override: int | None = None
     num_page_override: int | None = None  # if not None, will override the number of pages

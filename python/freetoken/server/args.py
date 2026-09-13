@@ -314,6 +314,29 @@ def parse_args(
         help="Use dummy weights for testing.",
     )
 
+    parser.add_argument(
+        "--skip-vision",
+        action=argparse.BooleanOptionalAction,
+        default=ServerArgs.skip_vision,
+        help="Skip loading the vision tower (model.visual.* / visual.*). Off for MLLM serving.",
+    )
+    parser.add_argument(
+        "--skip-mtp",
+        action=argparse.BooleanOptionalAction,
+        default=ServerArgs.skip_mtp,
+        help="Skip loading the MTP speculative head (mtp.*).",
+    )
+    parser.add_argument(
+        "--skip-carry",
+        action=argparse.BooleanOptionalAction,
+        default=ServerArgs.skip_carry,
+        help=(
+            "Skip loading the MLLM carry buffer (model.carry.*). Dropped by default so "
+            "MLLM checkpoints fit on small GPUs for text-only serving; pass --no-skip-carry "
+            "to load it."
+        ),
+    )
+
     assert ServerArgs.use_pynccl == True
     parser.add_argument(
         "--disable-pynccl",
