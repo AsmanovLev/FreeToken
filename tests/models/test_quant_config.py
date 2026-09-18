@@ -381,6 +381,26 @@ def test_unsupported_dialects_fail_closed(tmp_path):
         checkpoint_quant_config(str(tmp_path), hf_config, get_model_spec("Qwen3MoeForCausalLM"))
 
 
+def test_exl3_dialect_claims_and_leaves_dense_modules_bf16():
+    """EXL3 quantizes only the routed experts, which the family's offload hook
+    owns; QuantConfig must claim the checkpoint and hand every module bf16."""
+    from freetoken.layers.quantization import Exl3Config, LayerKind
+
+    hf_config = SimpleNamespace(
+        architectures=["Qwen3_5MoeForConditionalGeneration"],
+        quantization_config={"quant_method": "exl3", "bits": 2.75, "codebook": "mcg"},
+    )
+    qc = QuantConfig.from_hf(hf_config)
+    assert isinstance(qc, Exl3Config)
+    assert qc.scheme_for("model.language_model.layers.0.self_attn.q_proj") is None
+    assert qc.scheme_for("model.language_model.layers.3.mlp.shared_expert.gate_proj") is None
+    assert qc.scheme_for("model.language_model.layers.3.mlp.experts.0.gate_proj") is None
+    # the MoE layer must get NO method: exl3 experts are served by the offload
+    # cache's packed-bank branch, not an UnquantizedMoEMethod demanding bf16 banks
+    moe = qc.get_quant_method(SimpleNamespace(quant_layer_kind=LayerKind.MOE), "x.mlp")
+    assert moe is None
+
+
 # --------------------------------------------------------------------------- config against the stored tensors
 
 # leaf names FreeToken builds as Linear / MoE layers; routers, norms, convs never ask for a scheme

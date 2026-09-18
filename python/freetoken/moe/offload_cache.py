@@ -265,6 +265,18 @@ class OffloadMoeCache:
         self.decode_freq = torch.zeros(
             (self.num_layers, self.num_experts), dtype=torch.int64, device=self.device
         )
+        # One-shot routing-skew report (hot-set planner input): logged once after
+        # FT_ROUTING_STATS_AFTER (default 1024) per-layer decode calls.
+        self._freq_calls = 0
+        self._freq_logged = False
+        # Learned hot-set row order (None == checkpoint order): [L, E] tensor mapping
+        # expert id -> bank row. Routing ids are rewritten to rows before the cache
+        # kernels, matching the permuted host banks (see moe.expert_usage).
+        self.hot_perm = None
+        self.hot_perm_ram = None
+        # Where the routing histogram is persisted between sessions (None = no learning).
+        self.usage_path = None
+        self._usage_model = None
         # (per-layer sources, cache) per bank, in schema order. Every piece of cache
         # machinery that moves bank bytes (copy_missing, the prefill double buffers,
         # bank_views) iterates this list, so the slot cache is bank-count agnostic.
@@ -858,14 +870,56 @@ class OffloadMoeCache:
             self._prefill_buffer_has_release_event[buffer_id] = True
         self._prefill_buffer_released[buffer_id] = True
 
+    def set_hot_perm(self, perm, ram_experts: int | None = None) -> None:
+        """Install the learned expert->row order (None restores checkpoint order).
+
+        ``ram_experts`` lets the one-shot report measure the held-out hit of this
+        permutation (rows < ram_experts) against the run's own routing."""
+        self.hot_perm = None if perm is None else perm.detach().to(torch.int64)
+        self.hot_perm_ram = int(ram_experts) if perm is not None and ram_experts else None
+
+    def set_usage_persistence(self, path: str | None, model_path: str) -> None:
+        """Persist the routing histogram to ``path`` (learned hot-set across sessions)."""
+        self.usage_path = path or None
+        self._usage_model = model_path
+
+    def persist_usage(self) -> None:
+        """Merge this session's histogram into the usage file (no-op without a path)."""
+        if self.usage_path is None:
+            return
+        from freetoken.moe.expert_usage import load_usage, merge_usage, save_usage
+
+        freq = self.decode_freq.detach().to("cpu")
+        if int(freq.sum()) == 0:
+            return
+        old = load_usage(self.usage_path, *freq.shape)
+        save_usage(self.usage_path, merge_usage(old, freq), self._usage_model or "")
+
+    def record_routing(self, layer_id: int, expert_ids: torch.Tensor) -> None:
+        """Accumulate the raw (checkpoint-order) routing histogram for the planner."""
+        if not self.collect_decode_freq:
+            return
+        ids = expert_ids.reshape(-1).long()
+        self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
+        self._freq_calls += 1
+        self._maybe_log_routing_stats()
+        every = int(os.environ.get("FT_USAGE_SAVE_EVERY", "20000"))
+        if every and self.usage_path is not None and self._freq_calls % every == 0:
+            self.persist_usage()
+
+    def remap_routing_to_rows(self, layer_id: int, expert_ids: torch.Tensor) -> None:
+        """Rewrite expert ids to permuted bank rows, in place (no-op without perm)."""
+        if self.hot_perm is None:
+            return
+        perm = self.hot_perm[layer_id].to(expert_ids.device)
+        expert_ids.copy_(perm[expert_ids.long()])
+
     def ensure_experts(self, layer_id: int, expert_ids: torch.Tensor) -> None:
         from freetoken.moe.offload_kernels import ensure_experts
 
-        if self.collect_decode_freq:
-            # ``expert_ids`` still holds raw expert ids here (the kernel rewrites them to
-            # slot ids in place), so snapshot the routing histogram before that happens.
-            ids = expert_ids.reshape(-1).long()
-            self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
+        # learn from raw ids first, then rewrite to the permuted row ids the kernel wants
+        self.record_routing(layer_id, expert_ids)
+        self.remap_routing_to_rows(layer_id, expert_ids)
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
         ensure_experts(self, layer_id, expert_ids)
@@ -900,6 +954,8 @@ class OffloadMoeCache:
             # Disk tier: stream only the RAM-resident prefix, then fetch the routed
             # disk-resident experts into their identity slots (needs the routing).
             assert expert_ids is not None, "disk-tier prefill needs the routed expert ids"
+            self.record_routing(layer_id, expert_ids)
+            self.remap_routing_to_rows(layer_id, expert_ids)
             self._pending_src_layer = layer_id
             self._pending_whole_layer = True
             self._disk_tier.materialize_layer(self, layer_id, expert_ids)
@@ -1006,6 +1062,52 @@ class OffloadMoeCache:
             })
         return {"per_layer": per_layer}
 
+    def _maybe_log_routing_stats(self) -> None:
+        """One-shot per-process routing-skew report for the hot-set planner.
+
+        Silent unless the histogram has enough samples; failure is never fatal.
+        """
+        if self._freq_logged:
+            return
+        threshold = int(os.environ.get("FT_ROUTING_STATS_AFTER", "1024"))
+        if self._freq_calls < threshold:
+            return
+        self._freq_logged = True
+        try:
+            s = self.decode_routing_stats()
+        except Exception as exc:  # never break serving for a diagnostic
+            logger.warning_rank0(f"routing-stats failed: {exc!r}")
+            return
+        if s:
+            logger.info_rank0(
+                "routing-skew: experts_for_90pct={experts_for_90pct:.1f} "
+                "working_set_mean={working_set_mean:.1f} working_set_max={working_set_max} "
+                "oracle_hit_at_slots={oracle_hit_at_slots:.3f} "
+                "norm_entropy={norm_entropy:.3f}".format(**s)
+            )
+        if self._disk_tier is not None:
+            st = self._disk_tier.stats()
+            logger.info_rank0(
+                "disk-tier stats: fetched={experts_fetched} bytes={bytes_fetched} "
+                "prefetch_hits={prefetch_hits} prefetch_fetches={prefetch_fetches}".format(**st))
+        if self.hot_perm is not None and self.hot_perm_ram:
+            # Held-out generalization: how much of THIS run's routing lands in the
+            # prefix that was learned from a previous session (vs the workload's own
+            # best-possible set at the same budget).
+            f = self.decode_freq.detach().to("cpu").to(torch.float64)
+            perm = self.hot_perm.to("cpu")
+            k = int(self.hot_perm_ram)
+            tot = float(f.sum())
+            if tot > 0:
+                hit = float(f[perm < k].sum()) / tot
+                prefix_hit = float(f[:, :k].sum()) / tot
+                best, _ = torch.sort(f, dim=1, descending=True)
+                oracle = float(best[:, :k].sum()) / tot
+                logger.info_rank0(
+                    f"hot-set held-out hit: {hit:.3f} at K={k} "
+                    f"(checkpoint prefix {prefix_hit:.3f}, workload oracle {oracle:.3f})")
+        self.persist_usage()
+
     def decode_routing_stats(self) -> dict:
         """Per-layer decode routing concentration, for cache-skew analysis.
 
@@ -1038,15 +1140,20 @@ class OffloadMoeCache:
             "norm_entropy": norm_ent,
         }
 
-    def attach_disk_tier(self, index, ram_experts: int, workers: int = 8) -> None:
+    def attach_disk_tier(self, index, ram_experts: int, workers: int = 8, perm=None) -> None:
         """Enable the NVMe tier: disk-resident slot-cache misses are fetched from the
-        original checkpoint before the PCIe copy path (see moe/disk_tier.py)."""
+        original checkpoint before the PCIe copy path (see moe/disk_tier.py).
+
+        ``perm`` (``[L, E]`` int tensor) is the learned hot-set row order; the
+        host banks were loaded with it, so routing ids are remapped to rows."""
         from freetoken.moe.disk_tier import DiskTier
 
         assert self.decode_target == "gpu", "disk tier v0 supports the gpu (offload) path only"
-        assert self.quant_format == "nvfp4", f"disk tier v0 supports native nvfp4 banks (got {self.quant_format!r})"
+        assert self.quant_format in ("nvfp4", "exl3"), (
+            f"disk tier v0 supports native nvfp4 / exl3 banks (got {self.quant_format!r})")
         assert not self.prefill_overlap, "disk tier v0 does not support prefill overlap"
-        self._disk_tier = DiskTier(index, self, ram_experts, workers=workers)
+        self.set_hot_perm(perm, ram_experts)
+        self._disk_tier = DiskTier(index, self, ram_experts, workers=workers, perm=perm)
 
     def copy_missing(self) -> None:
         assert self.banks, "set_bank_sources must register the banks first"

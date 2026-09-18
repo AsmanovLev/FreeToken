@@ -614,7 +614,21 @@ class Engine:
             if problems:
                 raise ValueError(
                     "--moe-disk-tier on: unmet preconditions:\n  - " + "\n  - ".join(problems))
-            disk_tier = DiskTierSpec(ram_experts=config.expert_ram_experts)
+            # Learned hot-set: rank experts by routed frequency from the persisted usage
+            # file so the pinned prefix serves the HOT experts instead of checkpoint order.
+            # EXL3 only for now (its loader carries the row permutation; nvfp4 follows later).
+            perm = None
+            if config.model_config.expert_quant == "exl3":
+                from freetoken.moe.expert_usage import load_usage, plan_hot_set, usage_path
+
+                L = config.model_config.num_moe_layers
+                freq = load_usage(usage_path(config.model_path, L, E), L, E)
+                if freq is not None and int(freq.sum()) > 0:
+                    perm, _, hit = plan_hot_set(freq, config.expert_ram_experts)
+                    logger.info_rank0(
+                        f"disk tier: learned hot-set from {usage_path(config.model_path, L, E)} "
+                        f"(training hit {hit:.3f} at {config.expert_ram_experts}/{E} experts/layer)")
+            disk_tier = DiskTierSpec(ram_experts=config.expert_ram_experts, perm=perm)
         # Fast path: an FTW checkpoint loads its repacked banks directly.
         # Slow path: load_expert_banks auto-picks parallel vs serial baseline by
         # expert-tensor granularity. Both pin-after-fill.
@@ -696,7 +710,8 @@ class Engine:
         if banks.disk_index is not None:
             cache.attach_disk_tier(
                 banks.disk_index, banks.disk_ram_experts,
-                workers=config.disk_fetch_workers)
+                workers=config.disk_fetch_workers,
+                perm=(disk_tier.perm if disk_tier is not None else None))
             logger.info_rank0(
                 f"disk tier: {banks.disk_ram_experts}/{config.model_config.num_experts} "
                 f"experts/layer pinned in RAM; the rest fetched from "
@@ -714,6 +729,18 @@ class Engine:
         # Must be set before CUDA graph capture so the (device-side) accumulation ops are
         # captured and re-run on every decode replay.
         cache.collect_stats = config.moe_collect_stats
+        # The routing histogram feeds the learned hot-set planner. Always on for an EXL3
+        # disk-tier run (the permutation needs it); otherwise only with --moe-collect-stats.
+        learn_routing = (
+            disk_tier is not None and config.model_config.expert_quant == "exl3")
+        cache.collect_decode_freq = config.moe_collect_stats or learn_routing
+        if learn_routing:
+            from freetoken.moe.expert_usage import usage_path
+
+            cache.set_usage_persistence(
+                usage_path(config.model_path, config.model_config.num_moe_layers,
+                           config.model_config.num_experts),
+                config.model_path)
         layers = attach_offload_moe_cache(self.model, cache)
         assert len(layers) == config.model_config.num_moe_layers
         if cache.decode_target in ("cpu", "hybrid"):
@@ -1075,6 +1102,12 @@ class Engine:
         )
 
     def shutdown(self) -> None:
+        cache = getattr(self, "moe_offload_cache", None)
+        if cache is not None:
+            try:
+                cache.persist_usage()  # learned hot-set survives the session
+            except Exception:
+                pass
         self.graph_runner.destroy_cuda_graphs()
         torch.distributed.destroy_process_group()
         destroy_distributed()

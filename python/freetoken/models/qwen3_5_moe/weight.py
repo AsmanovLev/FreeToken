@@ -921,7 +921,8 @@ class _ShardReader:
         self._handles.clear()
 
 
-def _setup_exl3_banks(model_path, model_config, device, dummy, *, layer_sink=None):
+def _setup_exl3_banks(model_path, model_config, device, dummy, *, layer_sink=None, ram_experts=None,
+                      hot_perm=None):
     """Pack EXL3 routed-expert tables into pinned uint8 row banks (no dequant at load).
 
     Row layouts (see moe/fused_exl3.py): gate_up = gate.trellis | up.trellis |
@@ -980,9 +981,25 @@ def _setup_exl3_banks(model_path, model_config, device, dummy, *, layer_sink=Non
             "down": ((E, row_dn), torch.uint8),
         }
         hb = alloc_layer_banks(specs, L)  # lazy anon mmaps (zero-filled)
+        # Disk tier: resolve stripes BEFORE the load. With no learned permutation,
+        # experts [ram_experts, E) are never read (their bank rows stay unbacked)
+        # and the Exl3DiskIndex fetches them straight from the checkpoint on
+        # slot-cache miss. With a learned ``hot_perm`` the pinned rows [0, ram)
+        # hold the HOT experts instead (row = hot_perm[layer, expert]); the disk
+        # tier resolves row -> expert through the inverse.
+        assert hot_perm is None or ram_experts is not None, (
+            "hot_perm reorders the pinned prefix; it needs the disk tier's ram_experts")
+        disk_index = None
+        if ram_experts is not None:
+            from freetoken.moe.disk_tier import Exl3DiskIndex
+
+            disk_index = Exl3DiskIndex(model_path, model_config)
         banks = {name: [b.tensor for b in hb[name]] for name in specs}
         gate_up, down = banks["gate_up"], banks["down"]
         primary = get_tp_info().is_primary()
+
+        def _row_of(li: int, e: int) -> int:
+            return e if hot_perm is None else int(hot_perm[li][e])
 
         def _put(row: torch.Tensor, off: int, t: torch.Tensor) -> int:
             b = t.view(torch.uint8).reshape(-1)
@@ -996,8 +1013,11 @@ def _setup_exl3_banks(model_path, model_config, device, dummy, *, layer_sink=Non
                 layer = dense + li
                 tb = H * I * ks[li] // 8
                 for e in range(E):
+                    row_id = _row_of(li, e)
+                    if disk_index is not None and row_id >= ram_experts:
+                        continue  # disk-resident: the row stays unbacked
                     p = f"model.language_model.layers.{layer}.mlp.experts.{e}"
-                    row = gate_up[li][e]
+                    row = gate_up[li][row_id]
                     off = 0
                     for proj in ("gate", "up"):
                         t = reader.get(f"{p}.{proj}_proj.trellis")
@@ -1009,8 +1029,8 @@ def _setup_exl3_banks(model_path, model_config, device, dummy, *, layer_sink=Non
                     for proj in ("gate", "up"):
                         off = _put(row, off, reader.get(f"{p}.{proj}_proj.suh"))
                         off = _put(row, off, reader.get(f"{p}.{proj}_proj.svh"))
-                        assert off == row_gu
-                    row_d = down[li][e]
+                    assert off == row_gu
+                    row_d = down[li][row_id]
                     t = reader.get(f"{p}.down_proj.trellis")
                     assert t.numel() * 2 == tb, (
                         f"down K mismatch within layer {layer}: {p}.down_proj"
@@ -1028,18 +1048,27 @@ def _setup_exl3_banks(model_path, model_config, device, dummy, *, layer_sink=Non
     if layer_sink is not None:
         _load(layer_sink)
     elif torch.cuda.is_available():
-        with PinPipeline() as pins:
+        from freetoken.moe.disk_tier import check_tail_unbacked, release_bank_tails
+
+        with PinPipeline(prefix_rows=ram_experts) as pins:
             _load(pins)
+        if ram_experts is not None:
+            # The tier's RAM math: drop the never-read tail pages once the load
+            # has settled (the prefix is pinned; the tail was never written).
+            release_bank_tails(hb, E, ram_experts)
+            check_tail_unbacked(hb, E, ram_experts)
     else:
         _load(None)  # CUDA-less: mmap banks stay pageable, never pinned
     return ExpertBanks("exl3", banks, exl3_codebook=codebook,
-                       exl3_k_per_layer=tuple(ks), streamed=layer_sink is not None)
+                       exl3_k_per_layer=tuple(ks), streamed=layer_sink is not None,
+                       disk_index=disk_index,
+                       disk_ram_experts=ram_experts or 0)
 
 
 def setup_offload_expert_banks(
     model_path: str, model_config, *, device: torch.device, dtype: torch.dtype,
     dummy: bool = False, parallel: bool = False, workers: int = 8, chunk: int = 8 << 20,
-    decode_target: str = "gpu", layer_sink=None,
+    decode_target: str = "gpu", layer_sink=None, disk_tier=None,
 ):
     """Build the routed-expert offload banks. The qwen3_5_moe module always exports this hook,
     so it intercepts *every* qwen3_5_moe offload load -- defer non-block-fp8 checkpoints (plain
@@ -1060,7 +1089,9 @@ def setup_offload_expert_banks(
         if get_tp_info().size > 1:
             raise NotImplementedError("qwen3_5_moe exl3 expert banks support TP=1 only")
         return _setup_exl3_banks(model_path, model_config, device, dummy,
-                                 layer_sink=None if dummy else layer_sink)
+                                 layer_sink=None if dummy else layer_sink,
+                                 ram_experts=disk_tier.ram_experts if disk_tier is not None else None,
+                                 hot_perm=getattr(disk_tier, "perm", None))
     if eq != "fp8_block":
         from freetoken.moe.expert_banks import _PROVIDERS  # nvfp4 -> _nvfp4_banks, none -> _bf16_banks
 

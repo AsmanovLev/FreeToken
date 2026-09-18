@@ -26,6 +26,7 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+import re
 import struct
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -44,9 +45,15 @@ class DiskTierSpec:
 
     Experts ``[0, ram_experts)`` are pinned as usual; ``[ram_experts, E)`` keep
     their bank rows allocated but their pages are released after load and are
-    served from disk by :class:`DiskTier`."""
+    served from disk by :class:`DiskTier`.
+
+    ``perm`` (optional, ``[L, E]`` int tensor) is the learned hot-set row order:
+    ``perm[layer, expert]`` is the bank row that expert's weights live in, with
+    hot experts mapped to the low rows so the pinned prefix serves them. When
+    None the identity order is used (checkpoint order)."""
 
     ram_experts: int
+    perm: "torch.Tensor | None" = None
 
 
 def release_bank_tails(banks_by_name: dict[str, list[HostBank]], num_experts: int,
@@ -144,6 +151,31 @@ _NVP4_BANK_SEGS = (
     (("down_proj", "weight_scale_2", 0, None),),
 )
 
+# EXL3 bank order (== _BANK_SCHEMAS["exl3"]). Row fields are spliced on the
+# BYTE axis (see moe/fused_exl3.py for the layout doc), so segments carry their
+# own absolute row-destination offset instead of the nvfp4 output-row split.
+_EXL3_BANK_SEGS = (
+    # gate_up: gate.trellis @0 | up.trellis @tb_max | gate.suh | gate.svh | up.suh | up.svh
+    (
+        ("gate_proj", "trellis", 0),
+        ("up_proj", "trellis", "tb_max"),
+        ("gate_proj", "suh", "2_tb_max"),
+        ("gate_proj", "svh", "2_tb_max+2H"),
+        ("up_proj", "suh", "2_tb_max+2H+2I"),
+        ("up_proj", "svh", "2_tb_max+4H+2I"),
+    ),
+    # down: down.trellis @0 | down.suh @tb_max | down.svh @tb_max+2I
+    (
+        ("down_proj", "trellis", 0),
+        ("down_proj", "suh", "tb_max"),
+        ("down_proj", "svh", "tb_max+2I"),
+    ),
+)
+
+_EXL3_FIELD_VAR = {
+    "0": "zero", "tb_max": "tb_max", "2_tb_max": "2*tb_max", "2H": "2*H", "2I": "2*I",
+}
+
 
 
 def _preadv_error(tier, staging, shard_idx: int, off: int, a0: int, slen: int,
@@ -179,6 +211,35 @@ def _read_safetensors_offsets(path: str) -> dict[str, tuple[int, int]]:
     }
 
 
+def _read_safetensors_meta(path: str) -> dict[str, tuple[int, int, tuple[int, ...]]]:
+    """{tensor_name: (abs_start, abs_end, shape)} -- same math as
+    ``_read_safetensors_offsets`` plus the declared shape (exl3 needs it for the
+    per-layer K, without loading any tensor)."""
+    with open(path, "rb") as f:
+        (hlen,) = struct.unpack("<Q", f.read(8))
+        meta = json.loads(f.read(hlen))
+    base = 8 + hlen
+    out = {}
+    for k, v in meta.items():
+        if k == "__metadata__":
+            continue
+        out[k] = (
+            v["data_offsets"][0] + base,
+            v["data_offsets"][1] + base,
+            tuple(v.get("shape", ())),
+        )
+    return out
+
+
+# routed EXL3 expert tensors: trellis / suh / svh under experts.<e>.<proj>_proj.*
+# (the anchor ``layers.N.mlp.experts.E.`` keeps out the MTP head and shared experts)
+_EXL3_KEY_RE = re.compile(
+    r"^model\.(?:language_model\.)?layers\.(?P<layer>\d+)\.mlp\.experts\."
+    r"(?P<expert>\d+)\.(?P<proj>gate|up|down)_proj\.(?P<kind>trellis|suh|svh)$"
+)
+
+
+
 class Nvfp4DiskIndex:
     """(bank, layer, expert) -> per-segment (shard_idx, offset, nbytes) locations.
 
@@ -189,7 +250,7 @@ class Nvfp4DiskIndex:
     """
 
     def __init__(self, model_dir: str, config, spec) -> None:
-        from freetoken.models.nvfp4_banks import _num_moe_layers
+        from freetoken.models.nvfp4_banks import _canon_kind, _num_moe_layers
         from freetoken.utils.hf import download_hf_weight
 
         model_dir = download_hf_weight(model_dir)  # hub id -> local cache dir; no-op if local
@@ -198,7 +259,9 @@ class Nvfp4DiskIndex:
             weight_map = json.load(f)["weight_map"]
 
         num_layers = _num_moe_layers(config)
-        # (bank_layer, expert, proj, kind) -> (tensor_name, shard)
+        # (bank_layer, expert, proj, kind) -> (tensor_name, shard). Kind names are
+        # canonicalized (compressed-tensors' weight_packed -> weight, ...) so the
+        # bank segment tables below match however the checkpoint spells them.
         loc: dict[tuple[int, int, str, str], tuple[str, str]] = {}
         for name, shard in weight_map.items():
             m = spec.key_pattern.match(name)
@@ -207,8 +270,11 @@ class Nvfp4DiskIndex:
             bank_layer = spec.layer_to_bank(int(m.group("layer")), config)
             if bank_layer is None:
                 continue
-            loc[(bank_layer, int(m.group("expert")), m.group("proj"), m.group("kind"))] = (
-                name, shard)
+            loc[(bank_layer, int(m.group("expert")), m.group("proj"),
+                 _canon_kind(spec, m.group("kind")))] = (name, shard)
+        # compressed-tensors stores the QUANT-side global scale; the banks keep
+        # its reciprocal (matching nvfp4_banks._ingest_global).
+        self.global_reciprocal = bool(getattr(spec, "global_reciprocal", False))
 
         shards = sorted(set(shard for _, shard in loc.values()))
         self.shard_paths = [os.path.join(model_dir, s) for s in shards]
@@ -248,21 +314,234 @@ class Nvfp4DiskIndex:
         ]
 
 
+class _Exl3Seg:
+    __slots__ = ("shard_idx", "offset", "nbytes", "dst_off", "field")
+
+    def __init__(self, shard_idx: int, offset: int, nbytes: int, dst_off: int, field: int) -> None:
+        self.shard_idx = shard_idx
+        self.offset = offset
+        self.nbytes = nbytes
+        self.dst_off = dst_off
+        # full field width in the padded row: bytes [nbytes, field) beyond the
+        # checkpoint tensor must read as ZERO on the bank row (bytes [field,)
+        # are the next field and belong to another segment)
+        self.field = field
+
+
+# exl3 row layout in terms of (H, I, tb_max): field names -> byte offsets.
+# gate_up: gate.trellis | up.trellis | gate.suh | gate.svh | up.suh | up.svh
+# down:    down.trellis | down.suh | down.svh
+def _exl3_field_offsets() -> list[dict[str, str]]:
+    return [
+        {
+            "gate_trellis": "0",
+            "up_trellis": "tb_max",
+            "gate_suh": "2*tb_max",
+            "gate_svh": "2*tb_max+2*H",
+            "up_suh": "2*tb_max+2*H+2*I",
+            "up_svh": "2*tb_max+4*H+2*I",
+            "tb_max": "tb_max",
+        },
+        {
+            "down_trellis": "0",
+            "down_suh": "tb_max",
+            "down_svh": "tb_max+2*I",
+            "tb_max": "tb_max",
+        },
+    ]
+
+
+class Exl3DiskIndex:
+    """(bank, layer, expert) -> per-segment (shard, offset, nbytes, dst_off, field).
+
+    EXL3 rows are spliced from per-expert checkpoint tensors. The trellis field
+    is read at this layer's K (a mixed-rate recipe reads ``tb < tb_max`` bytes)
+    and padded with ZEROS to ``tb_max`` -- the row layout of every layer is
+    built for the checkpoint's MAX K (see _setup_exl3_banks). The fp16 suh/svh
+    sign scales sit at fixed byte offsets and copy 1:1. Per-layer K comes from
+    the shard safetensors headers, so building the index reads metadata only.
+    """
+
+    # segments per bank: (proj, kind, dst_off_terms, pads-to-field). Merely
+    # positive terms; off = sum of terms; "tbw" marks the trellis width base.
+    _SEGS = (
+        (
+            ("gate_proj", "trellis", (), True),
+            ("up_proj", "trellis", ("tb_max",), True),
+            ("gate_proj", "suh", ("tb_max", "tb_max"), False),
+            ("gate_proj", "svh", ("tb_max", "tb_max"), False),
+            ("up_proj", "suh", ("tb_max", "tb_max"), False),
+            ("up_proj", "svh", ("tb_max", "tb_max"), False),
+        ),
+        (
+            ("down_proj", "trellis", (), True),
+            ("down_proj", "suh", ("tb_max",), False),
+            ("down_proj", "svh", ("tb_max",), False),
+        ),
+    )
+    _ROW_NAMES = ("gate_up", "down")
+
+    def __init__(self, model_dir: str, config) -> None:
+        from freetoken.models.nvfp4_banks import _num_moe_layers
+        from freetoken.models.qwen3_5_moe.weight import _moe_dims
+        from freetoken.utils.hf import download_hf_weight
+
+        model_dir = download_hf_weight(model_dir)
+        index_path = os.path.join(model_dir, "model.safetensors.index.json")
+        with open(index_path, encoding="utf-8") as f:
+            weight_map = json.load(f)["weight_map"]
+
+        L, E, H, I, dense = _moe_dims(config)
+        num_layers = _num_moe_layers(config)
+        loc: dict[tuple[int, int, str, str], tuple[str, str]] = {}
+        for name, shard in weight_map.items():
+            m = _EXL3_KEY_RE.match(name)
+            if m is None:
+                continue
+            layer = int(m.group("layer")) - dense
+            if not (0 <= layer < num_layers):
+                continue
+            loc[(layer, int(m.group("expert")), m.group("proj") + "_proj",
+                 m.group("kind"))] = (name, shard)
+
+        shards = sorted(set(shard for _, shard in loc.values()))
+        self.shard_paths = [os.path.join(model_dir, s) for s in shards]
+        meta = {sh: _read_safetensors_meta(os.path.join(model_dir, sh)) for sh in shards}
+        shard_idx = {sh: i for i, sh in enumerate(shards)}
+
+        # pass 1: per-layer K (trellis shape of expert 0, stored int16 windows
+        # (H//16, I//16, K*16) -> trellis bytes tb = shape0*shape1*shape2*2)
+        tbs: list[int] = []
+        for layer in range(num_layers):
+            gkey = (layer, 0, "gate_proj", "trellis")
+            if gkey not in loc:
+                raise KeyError(
+                    f"disk tier: no exl3 gate_proj.trellis for layer {layer} in {index_path}")
+            gname, gshard = loc[gkey]
+            _, _, ts = meta[gshard][gname]
+            if (ts[0] * 16, ts[1] * 16) != (H, I):
+                raise ValueError(
+                    f"disk tier: exl3 layer {layer} trellis geometry {ts[0] * 16}x{ts[1] * 16}"
+                    f" != config {H}x{I}")
+            tb = ts[0] * ts[1] * ts[2] * 2
+            if tb <= 0 or tb > H * I:
+                raise ValueError(f"disk tier: exl3 layer {layer} trellis {tb} B bad")
+            tbs.append(tb)
+        k_per_layer = tuple(tb * 8 // (H * I) for tb in tbs)
+        self.k_per_layer = k_per_layer
+        tb_max = max(tbs)
+        row_gu = 2 * tb_max + 4 * H + 4 * I
+        row_dn = tb_max + 2 * H + 2 * I
+        row_bytes = (row_gu, row_dn)
+        # (proj, kind) -> dst byte offset within the padded row
+        dst_gu = {
+            ("gate_proj", "trellis"): 0,
+            ("up_proj", "trellis"): tb_max,
+            ("gate_proj", "suh"): 2 * tb_max,
+            ("gate_proj", "svh"): 2 * tb_max + 2 * H,
+            ("up_proj", "suh"): 2 * tb_max + 2 * H + 2 * I,
+            ("up_proj", "svh"): 2 * tb_max + 4 * H + 2 * I,
+        }
+        dst_dn = {
+            ("down_proj", "trellis"): 0,
+            ("down_proj", "suh"): tb_max,
+            ("down_proj", "svh"): tb_max + 2 * I,
+        }
+        dsts = (dst_gu, dst_dn)
+        seg_counts = tuple(len(seg) for seg in self._SEGS)
+
+        def _field_width(bank: int, kind: str) -> int:
+            if kind == "trellis":
+                return tb_max
+            if bank == 0:  # gate/up: input axis H, output axis I
+                return 2 * H if kind == "suh" else 2 * I
+            # down: input axis I, output axis H
+            return 2 * I if kind == "suh" else 2 * H
+
+        # pass 2: pack segments [(shard_idx, offset, nbytes, dst_off, field)] per
+        # expert row in bank order
+        self._seg_size = struct.calcsize("<iqqQQ")
+        self.row_seg_counts = seg_counts
+        self.entries: list[list[bytes]] = []
+        for bank, bank_segs in enumerate(self._SEGS):
+            n_seg = len(bank_segs)
+            src = row_gu if bank == 0 else row_dn
+            per_layer: list[bytes] = []
+            for layer in range(num_layers):
+                tb = tbs[layer]
+                rows = bytearray()
+                for e in range(E):
+                    for proj, kind, _, pads in bank_segs:
+                        key = (layer, e, proj, kind)
+                        entry = loc.get(key)
+                        if entry is None:
+                            raise KeyError(
+                                f"disk tier: no exl3 {proj}.{kind} tensor for layer {layer}"
+                                f" expert {e} in {index_path}")
+                        tname, tshard = entry
+                        tstart, tend, _ts = meta[tshard][tname]
+                        nbytes = tend - tstart
+                        expected = _field_width(bank, kind)
+                        if pads and nbytes != tb:
+                            raise ValueError(
+                                f"disk tier: exl3 L{layer} {proj} trellis {nbytes} B != {tb} B (K of e0)")
+                        if not pads and nbytes != expected:
+                            raise ValueError(
+                                f"disk tier: exl3 L{layer} {proj}.{kind} {nbytes} B != {expected} B")
+                        dst_off = dsts[bank][(proj, kind)]
+                        if dst_off + expected > src:
+                            raise ValueError(
+                                f"disk tier: exl3 L{layer} {proj}.{kind} field overruns its row")
+                        rows += struct.pack("<iqqQQ", shard_idx[tshard], tstart, nbytes,
+                                            dst_off, expected)
+                per_layer.append(bytes(rows))
+            self.entries.append(per_layer)
+        self.row_bytes = {"gate_up": row_gu, "down": row_dn}
+        self.tb_max = tb_max
+
+    def row_segments(self, bank_idx: int, layer: int, expert: int
+                     ) -> list[tuple[int, int, int, int, int]]:
+        """[(shard_idx, offset, nbytes, dst_off, field)] for one expert row.
+
+        ``field`` is the full padded-field width: bytes [nbytes, field) beyond
+        the checkpoint tensor must read as ZERO (mixed-rate trellis); scales
+        carry field == nbytes."""
+        n_seg = self.row_seg_counts[bank_idx]
+        base = expert * self._seg_size * n_seg
+        raw = self.entries[bank_idx][layer][base:base + self._seg_size * n_seg]
+        return [
+            struct.unpack_from("<iqqQQ", raw, i * self._seg_size)
+            for i in range(n_seg)
+        ]
 class DiskTier:
     """Runtime fetcher: disk-resident slot-cache misses -> staging -> GPU slot."""
 
-    def __init__(self, index: Nvfp4DiskIndex, cache, ram_experts: int, workers: int = 8) -> None:
+    def __init__(self, index: Nvfp4DiskIndex, cache, ram_experts: int, workers: int = 8,
+                 perm: "torch.Tensor | None" = None) -> None:
         self._index = index
         self._ram = ram_experts
+        self._exl3 = isinstance(index, Exl3DiskIndex)
+        # Learned hot-set row order: ``perm[layer, expert] -> row``. The cache
+        # hands us ROW ids; the checkpoint index speaks EXPERT ids, so keep the
+        # inverse for the translation. None == identity ordering.
+        self._perm = perm
+        self._perm_inv = None
+        if perm is not None:
+            self._perm_inv = torch.empty_like(perm)
+            self._perm_inv.scatter_(
+                1, perm, torch.arange(perm.shape[1]).expand(perm.shape[0], perm.shape[1]))
         self._banks = list(cache.banks)  # [(per_layer_host, gpu_cache)] in schema order
         self._row_bytes = [
             b[0][0][0].numel() * b[0][0][0].element_size() for b in self._banks
         ]  # full expert-row bytes per bank (staging must hold the biggest one)
-        # Per-bank destination row slices (gate|up split at the row midpoint).
+        # Per-bank destination row slices (gate|up split at the row midpoint); exl3
+        # rows carry their own byte destinations on each segment instead.
         self._dst_slices: list[list[tuple[int, int]]] = []
         for bank_idx, (host_layer, _gpu) in enumerate(self._banks):
             row = host_layer[0][0]
-            if len(_NVP4_BANK_SEGS[bank_idx]) == 2:
+            if self._exl3:
+                self._dst_slices.append([(0, row.numel())])
+            elif len(_NVP4_BANK_SEGS[bank_idx]) == 2:
                 mid = row.shape[0] // 2
                 self._dst_slices.append([(0, mid), (mid, row.shape[0])])
             else:
@@ -291,6 +570,16 @@ class DiskTier:
         self._decode_verify_steps = 0
         self._map_verify_steps = 0
         self._cache = cache
+        # Temporal prefetch (FT_DISK_PREFETCH_ROWS = total pinned rows to keep; 0 = off).
+        self._pf_budget = int(os.environ.get("FT_DISK_PREFETCH_ROWS", "0"))
+        self._pf: dict[tuple[int, int], list[HostBank]] = {}
+        self._pf_order: list[tuple[int, int]] = []
+        self._pf_inflight: dict[tuple[int, int], object] = {}
+        self._pf_lock = threading.Lock()
+        self._pf_hits = 0
+        self._pf_fetches = 0
+        self._last_rows: dict[int, tuple[int, ...]] = {}
+        self._pf_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="disk-tier-pf")
 
     # ------------------------------------------------------------------ fds
     def _fd(self, shard_idx: int) -> tuple[int, bool]:
@@ -350,11 +639,44 @@ class DiskTier:
         with torch.inference_mode():
             self._fetch_expert_inner(layer, expert, slot)
 
-    def _fetch_expert_inner(self, layer: int, expert: int, slot: int) -> None:
+    def _pack_row(self, layer: int, expert: int, rows: list[torch.Tensor]) -> None:
+        """Read one expert row from the checkpoint into ``rows`` (one per bank),
+        in the packed byte layout the slot cache expects. Used both for the
+        demand fetch (rows = GPU slots) and for prefetch (rows = host buffers)."""
         ring = self._staging_ring()
         ri = getattr(self._staging, "ri", 0)
-        for bank_idx, (_host_layer, gpu_cache) in enumerate(self._banks):
-            row = gpu_cache[slot]
+        for bank_idx, row in enumerate(rows):
+            if self._exl3:
+                # exl3 segments carry their own byte destinations; trellis
+                # segments pad their field with zeros (mixed-rate K < k_max).
+                segs = self._index.row_segments(bank_idx, layer, expert)
+                for (shard_idx, off, nbytes, dst_off, field) in segs:
+                    staging, ev = ring[ri]
+                    if ev is not None:
+                        ev.synchronize()
+                    ri = (ri + 1) % len(ring)
+                    fd, direct = self._fd(shard_idx)
+                    if direct:
+                        a0 = off & ~(_ALIGN - 1)
+                        slen = (off + nbytes - a0 + _ALIGN - 1) & ~(_ALIGN - 1)
+                    else:
+                        a0, slen = off, nbytes
+                    mv = (ctypes.c_char * slen).from_address(staging.addr)
+                    try:
+                        os.preadv(fd, [mv], a0)
+                    except OSError:
+                        raise _preadv_error(self, staging, shard_idx, off, a0, slen, direct)
+                    row_off = off - a0
+                    dst = row.view(torch.uint8)
+                    src = staging.tensor[row_off:row_off + nbytes]
+                    dst[dst_off:dst_off + nbytes].copy_(
+                        src.view(dst.dtype), non_blocking=True)
+                    if field > nbytes:
+                        # mixed-rate trellis: zero the tail of the padded field
+                        dst[dst_off + nbytes:dst_off + field].zero_()
+                    if ev is not None:
+                        ev.record()
+                continue
             segs = self._index.row_segments(bank_idx, layer, expert)
             for (d0, d1), (shard_idx, off, nbytes) in zip(self._dst_slices[bank_idx], segs):
                 staging, ev = ring[ri]
@@ -379,9 +701,12 @@ class DiskTier:
                     # Global-scale banks: the checkpoint stores a per-expert fp32
                     # SCALAR (weight_scale_2); the bank row is that value as fp16
                     # broadcast across the row -- convert + fill, no byte copy.
-                    val = staging.tensor[row_off:row_off + 4].view(torch.float32)[0].to(
-                        torch.float16)
-                    row[d0:d1].fill_(val)
+                    # compressed-tensors stores the quant-side scale, so invert
+                    # it first (see nvfp4_banks._ingest_global).
+                    val = staging.tensor[row_off:row_off + 4].view(torch.float32)[0]
+                    if getattr(self._index, "global_reciprocal", False):
+                        val = 1.0 / val
+                    row[d0:d1].fill_(val.to(torch.float16))
                     continue
                 src = staging.tensor[row_off:row_off + nbytes]
                 dst = row[d0:d1]
@@ -390,8 +715,93 @@ class DiskTier:
                     # Arm: the next reuse of this buffer waits for this copy.
                     ev.record()
         self._staging.ri = ri
+
+    def _fetch_expert_inner(self, layer: int, expert: int, slot: int) -> None:
+        rows = [gpu_cache[slot] for (_host, gpu_cache) in self._banks]
+        packed = self._take_prefetched(layer, expert)
+        if packed is not None:
+            # Prefetched earlier (predicted from the previous token): copy the packed
+            # host row into the slot instead of waiting on the disk.
+            for buf, row in zip(packed, rows):
+                row.reshape(-1).view(torch.uint8).copy_(buf.tensor, non_blocking=True)
+        else:
+            self._pack_row(layer, expert, rows)
         self._fetches += 1
         self._fetch_bytes += sum(self._row_bytes)
+
+    # ------------------------------------------------------------ prefetch
+    # Temporal lookahead (Colibri's PILOT, simplified): the disk rows a layer
+    # needed for the last token predict the next token's (routing persists across
+    # steps). Prefetch them into pinned host buffers in the background so the
+    # demand fetch is an H2D copy instead of a disk read. Prediction errors only
+    # waste I/O -- the demand path always falls back to reading the checkpoint.
+    def _new_pf_buffers(self) -> list[HostBank]:
+        bufs = []
+        for nbytes in self._row_bytes:
+            buf = HostBank((nbytes,), torch.uint8)
+            try:
+                buf.pin()
+            except Exception:
+                pass  # pageable is fine (slower H2D) on hosts without pinning
+            bufs.append(buf)
+        return bufs
+
+    def _take_prefetched(self, layer: int, row: int) -> list[HostBank] | None:
+        if self._pf_budget <= 0:
+            return None
+        key = (layer, row)
+        while True:
+            with self._pf_lock:
+                bufs = self._pf.pop(key, None)
+                if bufs is not None:
+                    try:
+                        self._pf_order.remove(key)
+                    except ValueError:
+                        pass
+                    self._pf_hits += 1
+                    return bufs
+                fut = self._pf_inflight.get(key)
+            if fut is None:
+                return None
+            fut.result()  # prefetch in flight: wait, then re-check the store
+
+    def _prefetch_row(self, layer: int, row: int) -> None:
+        try:
+            with torch.inference_mode():
+                bufs = self._new_pf_buffers()
+                self._pack_row(layer, row, [b.tensor for b in bufs])
+        except Exception:
+            with self._pf_lock:
+                self._pf_inflight.pop((layer, row), None)
+            return
+        key = (layer, row)
+        with self._pf_lock:
+            if self._pf_budget <= 0:
+                self._pf_inflight.pop(key, None)
+                return
+            self._pf[key] = bufs
+            self._pf_order.append(key)
+            # evict oldest beyond the budget (the just-stored key is youngest)
+            while len(self._pf_order) > self._pf_budget:
+                old = self._pf_order.pop(0)
+                self._pf.pop(old, None)
+            self._pf_inflight.pop(key, None)
+        self._pf_fetches += 1
+
+    def _schedule_prefetch(self, layer: int, rows) -> None:
+        if self._pf_budget <= 0:
+            return
+        # demand fetches are keyed by (layer, EXPERT); rows and experts are a
+        # bijection under the learned perm, so translate once here
+        experts = tuple(self._expert_of(int(r), layer) for r in rows)
+        self._last_rows[layer] = experts
+        for expert in experts:
+            key = (layer, expert)
+            with self._pf_lock:
+                if key in self._pf or key in self._pf_inflight:
+                    continue
+                self._pf_inflight[key] = self._pf_pool.submit(
+                    self._prefetch_row, layer, expert)
 
     def _sync_fetches(self) -> None:
         """Wait for the pool threads' async H2D copies to land.
@@ -444,6 +854,15 @@ class DiskTier:
         """Reference row bytes for (bank, layer, expert) straight from the checkpoint."""
         ref = torch.zeros(row_bytes, dtype=torch.uint8)
         segs = self._index.row_segments(bank_idx, layer, expert)
+        if self._exl3:
+            for (shard_idx, off, nbytes, dst_off, _field) in segs:
+                fd, direct = self._fd(shard_idx)
+                a0 = off if not direct else (off & ~(_ALIGN - 1))
+                slen = nbytes if not direct else (off + nbytes - a0 + _ALIGN - 1) & ~(_ALIGN - 1)
+                buf = os.pread(fd, slen, a0)
+                seg = buf[off - a0:off - a0 + nbytes]
+                ref[dst_off:dst_off + nbytes] = torch.frombuffer(seg, dtype=torch.uint8)
+            return ref
         for (d0, d1), (shard_idx, off, nbytes) in zip(self._dst_slices[bank_idx], segs):
             fd, direct = self._fd(shard_idx)
             a0 = off if not direct else (off & ~(_ALIGN - 1))
@@ -454,7 +873,10 @@ class DiskTier:
             if bank_idx in (2, 5):
                 import struct as _st
                 import numpy as _np
-                f16 = _np.float16(_st.unpack("<f", seg[:4])[0]).tobytes()
+                val = _st.unpack("<f", seg[:4])[0]
+                if getattr(self._index, "global_reciprocal", False):
+                    val = 1.0 / val
+                f16 = _np.float16(val).tobytes()
                 for r in range(d0, d1):
                     ref[r * row_el:(r + 1) * row_el] = torch.frombuffer(f16, dtype=torch.uint8)
             else:
@@ -573,7 +995,8 @@ class DiskTier:
                       flush=True)
                 nbad += 1
                 continue
-            expert = flat_id % cache.num_experts
+            row = flat_id % cache.num_experts
+            expert = self._expert_of(row, layer_id)
             for bank_idx, (_host_layer, gpu_cache) in enumerate(self._banks):
                 slot_row = gpu_cache[s].contiguous()
                 flat = slot_row.view(torch.uint8).reshape(-1)
@@ -590,6 +1013,12 @@ class DiskTier:
                               flush=True)
         print(f"[verify-map] step={self._map_verify_steps} slots={slots.numel()} bad={nbad}",
               flush=True)
+
+    def _expert_of(self, row: int, layer: int) -> int:
+        """Checkpoint expert id for a bank row (identity without a learned perm)."""
+        if self._perm_inv is None:
+            return row
+        return int(self._perm_inv[layer, row])
 
     def materialize_layer(self, cache, layer_id: int, expert_ids: torch.Tensor) -> None:
         """Disk-tier prefill: materialize the RAM-resident prefix into identity slots
@@ -623,16 +1052,18 @@ class DiskTier:
         # device-side (same dtype/device as usage) instead of .item()-ing it, which
         # would sync the stream once per layer on the prefill/decode path.
         futures = [
-            self._pool.submit(self._fetch_expert, layer_id, int(e), int(e))
-            for e in disk.tolist()
+            self._pool.submit(self._fetch_expert, layer_id,
+                              self._expert_of(int(row), layer_id), int(row))
+            for row in disk.tolist()
         ]
         for f in futures:
             f.result()
         self._sync_fetches()
         if os.environ.get("FT_DISK_TIER_VERIFY") and layer_id in (0, 20) and disk.numel() > 0:
             limit = disk.numel() if layer_id == 0 else 6  # layer 0: ALL experts (race hunt)
-            for e in disk.tolist()[:limit]:
-                self._verify_slot(cache, layer_id, int(e), phase="prefill")
+            for row in disk.tolist()[:limit]:
+                self._verify_slot(cache, layer_id, self._expert_of(int(row), layer_id),
+                                  slot=int(row), phase="prefill")
         # Same bookkeeping the materialize kernel writes, per fetched expert.
         flat = layer_id * cache.num_experts + disk
         cache.slot_for_id[layer_id, disk] = disk
@@ -654,20 +1085,24 @@ class DiskTier:
         if not disk:
             return
         futures = [
-            self._pool.submit(self._fetch_expert, layer_id, int(src[i]), int(slots[i]))
+            self._pool.submit(self._fetch_expert, layer_id,
+                              self._expert_of(int(src[i]), layer_id), int(slots[i]))
             for i in disk
         ]
         for f in futures:
             f.result()
         self._sync_fetches()
+        # Predict the next token: the rows this layer missed are likely needed again.
+        self._schedule_prefetch(layer_id, [int(src[i]) for i in disk])
         if (os.environ.get("FT_DISK_TIER_VERIFY") and layer_id == 0
                 and self._decode_verify_steps < 3):
             self._decode_verify_steps += 1
             for i in disk[:8]:
                 print(f"[verify-decode] step={self._decode_verify_steps} "
-                      f"expert={int(src[i])} slot={int(slots[i])} ndisk={len(disk)}", flush=True)
-                self._verify_slot(cache, layer_id, int(src[i]), int(slots[i]),
-                                  phase="decode")
+                      f"row={int(src[i])} slot={int(slots[i])} ndisk={len(disk)}", flush=True)
+                self._verify_slot(cache, layer_id,
+                                  self._expert_of(int(src[i]), layer_id),
+                                  int(slots[i]), phase="decode")
         disk_set = set(disk)
         ram = [i for i in range(n) if i not in disk_set]
         if ram:
@@ -682,4 +1117,9 @@ class DiskTier:
         self._cache = cache
 
     def stats(self) -> dict:
-        return {"experts_fetched": self._fetches, "bytes_fetched": self._fetch_bytes}
+        return {
+            "experts_fetched": self._fetches,
+            "bytes_fetched": self._fetch_bytes,
+            "prefetch_hits": self._pf_hits,
+            "prefetch_fetches": self._pf_fetches,
+        }

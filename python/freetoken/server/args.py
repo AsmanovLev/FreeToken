@@ -767,6 +767,18 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-collect-stats",
+        action="store_true",
+        dest="moe_collect_stats",
+        default=ServerArgs.moe_collect_stats,
+        help=(
+            "Collect per-layer MoE decode routing statistics (miss rate and, with the "
+            "disk tier, a routing histogram for the learned hot-set planner). Requires "
+            "CUDA graphs disabled to be accurate."
+        ),
+    )
+
+    parser.add_argument(
         "--shell-mode",
         action="store_true",
         help="Run the server in shell mode.",

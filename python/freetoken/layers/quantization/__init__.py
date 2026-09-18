@@ -27,6 +27,7 @@ from .quant_backend import QuantBackend, get_quant_backend, set_quant_backend
 from .names import NameMap
 from .configs import (
     CompressedTensorsConfig,
+    Exl3Config,
     Fp8BlockConfig,
     ModelOptConfig,
     Mxfp4Config,
@@ -47,6 +48,6 @@ __all__ = [
     "BankSpec", "ExpertView", "MoEConfig", "MoEKernel", "MoEMethod",
     "UnquantizedMoEMethod", "Fp8BlockMoEMethod", "Nvfp4MoEMethod", "Mxfp4MoEMethod", "Mxfp8MoEMethod",
     "QuantBackend", "set_quant_backend", "get_quant_backend", "NameMap",
-    "QuantConfig", "NoQuantConfig", "ModelOptConfig", "CompressedTensorsConfig", "Fp8BlockConfig", "Mxfp4Config",
+    "QuantConfig", "NoQuantConfig", "ModelOptConfig", "CompressedTensorsConfig", "Exl3Config", "Fp8BlockConfig", "Mxfp4Config",
     "quant_method_for", "quantization_config_of", "set_quant_config", "get_quant_config", "finalize_quant",
 ]

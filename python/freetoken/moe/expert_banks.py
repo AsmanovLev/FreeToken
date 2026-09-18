@@ -343,6 +343,34 @@ def bank_bytes_estimate(model_config, method=None) -> int | None:
     return layers * experts * per_expert(hidden, inter)
 
 
+def _exl3_setup_override(model_config):
+    """The model registry's ``setup_offload_expert_banks`` hook for EXL3 expert
+    checkpoints only.
+
+    The quantization refactor (#418) rebuilt bank packing around QuantMethods, but
+    EXL3 (QTIP trellis) has no QuantMethod: its layers run offload with
+    quant_method=None and the format tag "exl3" (see layers/moe.py's _expert_gemm),
+    and its banks are spliced per-model from trellis/suh/svh tables. The hook owns
+    that packing -- nvfp4 / fp8 / bf16 stay on the method path this refactor
+    introduced.
+    """
+    if getattr(model_config, "expert_quant", None) != "exl3":
+        return None
+    architectures = getattr(model_config, "architectures", None)
+    if not architectures:
+        return None
+    from freetoken.models.register import _load_attr, get_model_spec
+
+    try:
+        spec = get_model_spec(architectures[0])
+    except ValueError:
+        return None
+    try:
+        return _load_attr(spec.module, "setup_offload_expert_banks")
+    except AttributeError:
+        return None
+
+
 def load_expert_banks(
     model_path: str,
     model_config,
@@ -429,6 +457,10 @@ def load_expert_banks(
     from freetoken.moe.host_banks import requested_residency
 
     def _build(par: bool) -> ExpertBanks:
+        setup = _exl3_setup_override(model_config)
+        if setup is not None:
+            return setup(model_path, model_config, device=device, dtype=dtype, dummy=dummy,
+                         disk_tier=disk_tier)
         if method is not None:
             return _method_expert_banks(model_path, model_config, method, device, dummy, par, workers, chunk,
                                         layer_sink, disk_tier=disk_tier)

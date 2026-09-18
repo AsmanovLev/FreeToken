@@ -350,3 +350,84 @@ def test_release_bank_tails_unaligned_row_boundary():
     bank2.tensor.fill_(7)
     release_bank_tails({"gate_up_scale": [bank2]}, E, 128)
     assert resident_pages(bank2.addr + 128 * 2048, bank2.nbytes - 128 * 2048) == 0
+
+
+def test_compressed_tensors_kinds_map_onto_the_bank_segments(tmp_path):
+    """A compressed-tensors NVFP4 checkpoint spells its segments weight_packed /
+    weight_scale / weight_global_scale. The disk index must canonicalize those
+    kinds (kind_map) and invert the quant-side global scale (global_reciprocal)
+    to match the banks the loader packs, otherwise every disk fetch KeyErrors."""
+    import json
+    import re
+
+    import safetensors.torch
+
+    from freetoken.models.nvfp4_banks import Nvfp4ExpertSourceSpec
+
+    h, i, e, layers = H, I, 1, 1
+    spec = Nvfp4ExpertSourceSpec(
+        key_pattern=re.compile(
+            r"^model\.language_model\.layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\."
+            r"(?P<proj>gate_proj|up_proj|down_proj)\."
+            r"(?P<kind>weight_packed|weight_global_scale|weight_scale)$"
+        ),
+        proj_to_role={"gate_proj": "gate", "up_proj": "up", "down_proj": "down"},
+        layer_to_bank=lambda layer, config: layer,
+        desc="ct disk-tier test",
+        kind_map={"weight_packed": "weight", "weight_global_scale": "weight_scale_2"},
+        global_reciprocal=True,
+    )
+    shapes = {
+        ("gate_proj", "weight_packed"): (i, h // 2),
+        ("up_proj", "weight_packed"): (i, h // 2),
+        ("down_proj", "weight_packed"): (h, i // 2),
+        ("gate_proj", "weight_scale"): (i, h // 16),
+        ("up_proj", "weight_scale"): (i, h // 16),
+        ("down_proj", "weight_scale"): (h, i // 16),
+    }
+    tensors = {}
+    weight_map = {}
+    for proj, kind in list(shapes) + [(p, "weight_global_scale")
+                                      for p in ("gate_proj", "up_proj", "down_proj")]:
+        name = f"model.language_model.layers.0.mlp.experts.0.{proj}.{kind}"
+        if kind == "weight_global_scale":
+            tensors[name] = torch.tensor(2.0, dtype=torch.float32)  # quant-side scale
+        else:
+            shp = shapes[(proj, kind)]
+            n = shp[0] * shp[1]
+            tensors[name] = torch.arange(n, dtype=torch.int32).to(torch.uint8).reshape(shp)
+        weight_map[name] = "model-00001-of-00001.safetensors"
+    safetensors.torch.save_file(tensors, str(tmp_path / "model-00001-of-00001.safetensors"),
+                                metadata={"format": "pt"})
+    with open(tmp_path / "model.safetensors.index.json", "w", encoding="utf-8") as f:
+        json.dump({"weight_map": weight_map, "metadata": None}, f)
+
+    config = types.SimpleNamespace(num_experts=e, num_moe_layers=layers, num_layers=layers,
+                                   first_k_dense_replace=0, hidden_size=h,
+                                   moe_intermediate_size=i)
+    index = Nvfp4DiskIndex(str(tmp_path), config, spec)
+    assert index.global_reciprocal is True
+    for bank_idx in range(6):
+        segs = index.row_segments(bank_idx, 0, 0)
+        assert sum(nb for _, _, nb in segs) > 0
+
+    # The fetched global-scale banks must hold the RECIPROCAL (1/2 = 0.5) as fp16.
+    cache = _fake_cache()
+    tier = DiskTier(index, cache, ram_experts=0, workers=1)
+    import threading
+
+    local = threading.local()
+
+    def _staging_ring():
+        ring = getattr(local, "ring", None)
+        if ring is None:
+            ring = [[HostBank((tier._staging_size,), torch.uint8), None]
+                    for _ in range(tier._STAGING_RING)]
+            local.ring = ring
+        return ring
+
+    tier._staging_ring = _staging_ring
+    tier._fetch_expert(0, 0, 0)
+    for bank_idx in (2, 5):
+        row = cache.banks[bank_idx][1][0]
+        assert torch.equal(row.float(), torch.full_like(row.float(), 0.5)), (bank_idx, row)

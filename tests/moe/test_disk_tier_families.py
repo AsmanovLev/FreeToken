@@ -26,10 +26,11 @@ def test_family_exposes_a_source_spec_hook(family):
         "the disk tier cannot build a disk index for it")
 
 
-@pytest.mark.parametrize("family", [f for f in NVFP4_FAMILIES if f != "glm5_next"])
+@pytest.mark.parametrize("family", [f for f in NVFP4_FAMILIES if f not in ("glm5_next", "qwen3_5_moe")])
 def test_hook_returns_the_spec_the_loader_uses(family):
-    # glm5_next is excluded here only because its hook reads the checkpoint config to pick
-    # between the compressed-tensors and modelopt namings; it is covered by the test below.
+    # glm5_next and qwen3_5_moe are excluded here only because their hooks read
+    # the checkpoint's quant_method to pick between the compressed-tensors and
+    # modelopt namings; each is covered by a follow-the-checkpoint test below.
     mod = importlib.import_module(f"freetoken.models.{family}.weight")
     spec = mod.nvfp4_expert_spec("unused/for/these/families", None)
     assert spec is mod._NVFP4_SOURCE_SPEC
@@ -39,6 +40,19 @@ def test_hook_returns_the_spec_the_loader_uses(family):
 
 def test_glm5_next_hook_follows_the_checkpoint_quant_method(monkeypatch):
     mod = importlib.import_module("freetoken.models.glm5_next.weight")
+
+    class _Cfg:
+        def __init__(self, method):
+            self.quantization_config = {"quant_method": method}
+
+    monkeypatch.setattr(mod, "cached_load_hf_config", lambda path: _Cfg("compressed-tensors"))
+    assert mod.nvfp4_expert_spec("p", None) is mod._NVFP4_CT_SOURCE_SPEC
+    monkeypatch.setattr(mod, "cached_load_hf_config", lambda path: _Cfg("modelopt"))
+    assert mod.nvfp4_expert_spec("p", None) is mod._NVFP4_SOURCE_SPEC
+
+
+def test_qwen3_5_moe_hook_follows_the_checkpoint_quant_method(monkeypatch):
+    mod = importlib.import_module("freetoken.models.qwen3_5_moe.weight")
 
     class _Cfg:
         def __init__(self, method):
