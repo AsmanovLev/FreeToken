@@ -51,11 +51,12 @@ def _deq(kc, vc, idx, heads, head_dim, fmt):
 
 
 @pytest.mark.parametrize("fmt", ["iso3", "iso4"])
-@pytest.mark.parametrize("hq,hkv,d", [(4, 2, 256), (8, 2, 128), (16, 8, 128)])
-def test_decode(fmt, hq, hkv, d):
+@pytest.mark.parametrize("hq,hkv,d", [(4, 2, 256), (8, 2, 128), (16, 8, 128), (16, 2, 256)])
+@pytest.mark.parametrize("num_splits", [None, 1, 64])
+def test_decode(fmt, hq, hkv, d, num_splits):
     torch.manual_seed(9)
     dev = "cuda"
-    lens = [1, 37, 200]
+    lens = [1, 37, 200, 3001]
     total = sum(lens)
     slots = total + 16
     kc, vc = _make_pool(slots, hkv, d, fmt, dev)
@@ -64,11 +65,12 @@ def test_decode(fmt, hq, hkv, d):
     idx = torch.randperm(slots, device=dev, dtype=torch.int32)[:total]
     _store(k, v, idx, hkv, d, fmt, kc, vc)
 
-    indptr = torch.tensor([0, lens[0], lens[0] + lens[1], total], dtype=torch.int32, device=dev)
+    indptr = torch.tensor([0] + lens, dtype=torch.int32, device=dev).cumsum(0, dtype=torch.int32)
     q = (torch.randn(len(lens), hq * d, device=dev)).to(torch.bfloat16)
     out = torch.empty_like(q)
     scale = d ** -0.5
-    iso.iso_attention_decode(q, out, kc, vc, indptr, idx, hq, hkv, d, scale, fmt)
+    iso.iso_attention_decode(q, out, kc, vc, indptr, idx, hq, hkv, d, scale, fmt,
+                             num_splits=num_splits)
     torch.cuda.synchronize()
 
     kd, vd = _deq(kc, vc, idx, hkv, d, fmt)
