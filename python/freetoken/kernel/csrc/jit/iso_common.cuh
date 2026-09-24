@@ -173,37 +173,84 @@ __device__ __forceinline__ void iso_quantize_block(const __nv_bfloat16 *src,
   }
 }
 
+// Raw packed bytes of one 4D group, split from the decode so hot loops can
+// issue the loads for the next token before decoding the current one.
+struct IsoGroupRaw {
+  uint32_t lo;  // iso3: 2-bit indices byte; iso4: first nibble byte
+  uint32_t hi;  // iso3: signs byte;         iso4: second nibble byte
+  __half norm;
+};
+
+template <int FMT>
+__device__ __forceinline__ IsoGroupRaw iso_load_group(const uint8_t *src, int g) {
+  IsoGroupRaw r;
+  if constexpr (FMT == 3) {
+    r.lo = src[2 + g];
+    r.hi = src[2 + 32 + (g >> 1)];
+  } else {
+    r.lo = src[4 + 2 * g];
+    r.hi = src[4 + 2 * g + 1];
+  }
+  r.norm = *reinterpret_cast<const __half *>(src);
+  return r;
+}
+
+// Dequantize 4D group `g` (elements 4g..4g+3) of one packed block to fp32.
+// `cent` is the centroid table and `qc` the conjugated quaternion of group g,
+// passed in so hot loops can keep them in shared memory / registers: per-lane
+// divergent reads of the __constant__ tables serialize.
+template <int FMT>
+__device__ __forceinline__ void iso_decode_group(const IsoGroupRaw &raw, int g,
+                                                 const float *cent,
+                                                 const float (&qc)[4],
+                                                 float (&out)[4]) {
+  float c0, c1, c2, c3;
+  if constexpr (FMT == 3) {
+    const uint32_t qs = raw.lo, sg = raw.hi;
+    const int sh = (g & 1) * 4;
+    c0 = cent[(qs & 3) | (((sg >> sh) & 1) << 2)];
+    c1 = cent[((qs >> 2) & 3) | (((sg >> (sh + 1)) & 1) << 2)];
+    c2 = cent[((qs >> 4) & 3) | (((sg >> (sh + 2)) & 1) << 2)];
+    c3 = cent[((qs >> 6) & 3) | (((sg >> (sh + 3)) & 1) << 2)];
+  } else {
+    const uint32_t b0 = raw.lo, b1 = raw.hi;
+    c0 = cent[b0 & 0xF];
+    c1 = cent[(b0 >> 4) & 0xF];
+    c2 = cent[b1 & 0xF];
+    c3 = cent[(b1 >> 4) & 0xF];
+  }
+  const float norm = __half2float(raw.norm);
+  // inverse rotation: Hamilton product conj(q_g) * c
+  const float qw = qc[0], qx = qc[1], qy = qc[2], qz = qc[3];
+  out[0] = (qw * c0 - qx * c1 - qy * c2 - qz * c3) * norm;
+  out[1] = (qw * c1 + qx * c0 + qy * c3 - qz * c2) * norm;
+  out[2] = (qw * c2 - qx * c3 + qy * c0 + qz * c1) * norm;
+  out[3] = (qw * c3 + qx * c2 - qy * c1 + qz * c0) * norm;
+}
+
+__device__ __forceinline__ void iso_conj_quat(int g, float (&qc)[4]) {
+  qc[0] = kIsoQuat[g][0];
+  qc[1] = -kIsoQuat[g][1];
+  qc[2] = -kIsoQuat[g][2];
+  qc[3] = -kIsoQuat[g][3];
+}
+
+template <int FMT>
+__device__ __forceinline__ const float *iso_centroids() {
+  if constexpr (FMT == 3) return kIsoCent3;
+  else return kIsoCent4;
+}
+
 // Warp-cooperative dequantize of one packed block back to 128 bf16 values.
 template <int FMT>
 __device__ __forceinline__ void iso_dequantize_block(const uint8_t *src,
                                                      __nv_bfloat16 *dst,
                                                      int lane) {
-  float c0, c1, c2, c3;
-  if constexpr (FMT == 3) {
-    const uint32_t qs = src[2 + lane];
-    const uint32_t sg = src[2 + 32 + (lane >> 1)];
-    const int sh = (lane & 1) * 4;
-    c0 = kIsoCent3[(qs & 3) | (((sg >> sh) & 1) << 2)];
-    c1 = kIsoCent3[((qs >> 2) & 3) | (((sg >> (sh + 1)) & 1) << 2)];
-    c2 = kIsoCent3[((qs >> 4) & 3) | (((sg >> (sh + 2)) & 1) << 2)];
-    c3 = kIsoCent3[((qs >> 6) & 3) | (((sg >> (sh + 3)) & 1) << 2)];
-  } else {
-    const uint32_t b0 = src[4 + 2 * lane], b1 = src[4 + 2 * lane + 1];
-    c0 = kIsoCent4[b0 & 0xF];
-    c1 = kIsoCent4[(b0 >> 4) & 0xF];
-    c2 = kIsoCent4[b1 & 0xF];
-    c3 = kIsoCent4[(b1 >> 4) & 0xF];
-  }
-  const float norm = __half2float(*reinterpret_cast<const __half *>(src));
-  // inverse rotation: conj(q_lane) ⊗ c
-  const float qw = kIsoQuat[lane][0], qx = -kIsoQuat[lane][1];
-  const float qy = -kIsoQuat[lane][2], qz = -kIsoQuat[lane][3];
-  const float rw = qw * c0 - qx * c1 - qy * c2 - qz * c3;
-  const float rx = qw * c1 + qx * c0 + qy * c3 - qz * c2;
-  const float ry = qw * c2 - qx * c3 + qy * c0 + qz * c1;
-  const float rz = qw * c3 + qx * c2 - qy * c1 + qz * c0;
-  __nv_bfloat162 lo = __floats2bfloat162_rn(rw * norm, rx * norm);
-  __nv_bfloat162 hi = __floats2bfloat162_rn(ry * norm, rz * norm);
+  float qc[4], r[4];
+  iso_conj_quat(lane, qc);
+  iso_decode_group<FMT>(iso_load_group<FMT>(src, lane), lane, iso_centroids<FMT>(), qc, r);
+  __nv_bfloat162 lo = __floats2bfloat162_rn(r[0], r[1]);
+  __nv_bfloat162 hi = __floats2bfloat162_rn(r[2], r[3]);
   uint2 out;
   out.x = *reinterpret_cast<const uint32_t *>(&lo);
   out.y = *reinterpret_cast<const uint32_t *>(&hi);

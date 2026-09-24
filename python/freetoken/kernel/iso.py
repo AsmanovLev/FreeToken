@@ -313,6 +313,19 @@ def _nb_gt(nheads_q: int, nheads_kv: int, head_dim: int) -> tuple[int, int]:
     return nb, gt
 
 
+@functools.cache
+def _num_sms(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+def decode_num_splits(num_reqs: int, nheads_kv: int, device: torch.device) -> int:
+    """KV splits per (request, kv_head) for split-K decode: enough blocks to fill
+    the GPU ~4 deep. Depends only on the batch shape, never on sequence lengths,
+    so a captured CUDA graph's grid stays valid across replays."""
+    target = 4 * _num_sms(torch.device(device).index or 0)
+    return max(1, min(64, -(-target // max(1, num_reqs * nheads_kv))))
+
+
 def iso_attention_decode(
     q: torch.Tensor,
     out: torch.Tensor,
@@ -325,13 +338,23 @@ def iso_attention_decode(
     head_dim: int,
     scale: float,
     fmt: str,
+    num_splits: int | None = None,
 ) -> None:
     """Decode attention over the packed pool: q (R, nheads_q*head_dim) bf16."""
     check_format(fmt)
     nb, gt = _nb_gt(nheads_q, nheads_kv, head_dim)
+    num_reqs = q.shape[0]
+    if num_splits is None:
+        num_splits = decode_num_splits(num_reqs, nheads_kv, q.device)
+    o_part = torch.empty(
+        num_reqs * num_splits, nheads_q, head_dim, dtype=torch.float32, device=q.device
+    )
+    ml_part = torch.empty(
+        num_reqs * num_splits, nheads_q, 2, dtype=torch.float32, device=q.device
+    )
     _iso_attn_module(fmt, nb, gt).decode(
-        q, out, k_cache, v_cache, kv_indptr, kv_indices, nheads_q, nheads_kv,
-        head_dim, scale,
+        q, out, k_cache, v_cache, kv_indptr, kv_indices, o_part, ml_part, nheads_q,
+        nheads_kv, head_dim, scale, num_splits,
     )
 
 
